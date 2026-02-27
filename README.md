@@ -1,10 +1,10 @@
-# fast_decimal - Rust High-Performance Decimal Fixed-point Arithmetic
+# fin_decimal - Rust High-Performance Decimal Fixed-point Arithmetic
 
-[![Build Status](https://travis-ci.org/vsukhoml/fast_decimal.svg?branch=master)](https://travis-ci.org/vsukhoml/fast_decimal)
+[![Build Status](https://travis-ci.org/vsukhoml/fin_decimal.svg?branch=master)](https://travis-ci.org/vsukhoml/fin_decimal)
 
-`fast_decimal` is a high-performance, `#![no_std]` compatible decimal fixed-point library tailored specifically for financial and tax computations. 
+`fin_decimal` is a high-performance, `#![no_std]` compatible decimal fixed-point library tailored specifically for financial and tax computations. 
 
-Unlike arbitrary-precision "big decimal" libraries that are slow and heap-allocate, or standard floating-point numbers (`f32`/`f64`) which suffer from rounding errors and precision loss, `fast_decimal` operates on an implicit scaling factor over a standard 64-bit signed integer (`i64`). 
+Unlike arbitrary-precision "big decimal" libraries that are slow and heap-allocate, or standard floating-point numbers (`f32`/`f64`) which suffer from rounding errors and precision loss, `fin_decimal` operates on an implicit scaling factor over a standard 64-bit signed integer (`i64`). 
 
 This means additions and subtractions compile down to single, lightning-fast native CPU instructions, while multiplications and divisions utilize 128-bit math (with platform-specific inline assembly on `x86_64`) to guarantee strictly compliant decimal rounding without floating-point artifacts.
 
@@ -19,11 +19,11 @@ This means additions and subtractions compile down to single, lightning-fast nat
 
 ## Getting Started
 
-Add `fast_decimal` to your `Cargo.toml`. To enable JSON serialization, include the `serde` feature:
+Add `fin_decimal` to your `Cargo.toml`. To enable JSON serialization, include the `serde` feature:
 
 ```toml
 [dependencies]
-fast_decimal = { version = "0.1", features = ["serde"] }
+fin_decimal = { version = "0.1", features = ["serde"] }
 ```
 
 ## Basic Usage
@@ -31,7 +31,7 @@ fast_decimal = { version = "0.1", features = ["serde"] }
 The library provides trait overloads, so the standard `+`, `-`, `*`, `/`, and `%` operators work ergonomically alongside native primitives. By default, standard multiplication and division utilize standard "Half-Up" financial rounding.
 
 ```rust
-use fast_decimal::Amount64;
+use fin_decimal::Amount64;
 use core::str::FromStr;
 
 fn main() {
@@ -56,7 +56,7 @@ fn main() {
 When calculating taxes or complex financial algorithms, regulations often dictate exact rounding constraints. Use the `Rounding` enum to dictate exactly how calculations terminate.
 
 ```rust
-use fast_decimal::{Amount64, Rounding};
+use fin_decimal::{Amount64, Rounding};
 
 fn main() {
     let tax_rate = Amount64::from(0.075); // 7.5%
@@ -80,7 +80,7 @@ Because `Amount64` is backed by a 64-bit integer, values exceeding `~922,337,203
 For robust backends, always use the `checked_*` routines to gracefully handle theoretical overflows:
 
 ```rust
-use fast_decimal::Amount64;
+use fin_decimal::Amount64;
 
 fn main() {
     let massive_balance = Amount64::MAX;
@@ -98,7 +98,7 @@ fn main() {
 If you are dealing with fractional percentages or Forex multi-currency pipelines, 4 decimal places is rarely enough. The `Rate64` type provides 8 decimal places of precision automatically.
 
 ```rust
-use fast_decimal::{Amount64, Rate64};
+use fin_decimal::{Amount64, Rate64};
 
 fn main() {
     let usd_to_jpy = Rate64::from(150.12345678);
@@ -109,5 +109,5 @@ fn main() {
 ## Why Not `f64` or Big Numbers?
 
 1. **Floating Point (`f64`)**: Floats cannot perfectly represent base-10 decimals. `0.1 + 0.2` famously equals `0.30000000000000004` in floating-point math, violating strict accounting properties.
-2. **Big Numbers (e.g. `num-bigint` or `rust-decimal`)**: These libraries perform heap allocations on virtually every math operation and represent numbers internally as slow arrays or `Vec`s. `fast_decimal` relies purely on `i64` CPU registers, making it orders of magnitude faster.
+2. **Big Numbers (e.g. `num-bigint` or `rust-decimal`)**: These libraries perform heap allocations on virtually every math operation and represent numbers internally as slow arrays or `Vec`s. `fin_decimal` relies purely on `i64` CPU registers, making it orders of magnitude faster.
 3. **The Sweet Spot**: The ±9.22 trillion limit of `Amount64` is vastly more than sufficient for 99% of general ledger entries, eCommerce carts, and standard banking, while reaping the ultimate performance benefits of fixed-width hardware math.

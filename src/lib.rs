@@ -1,6 +1,6 @@
 //!
 //! A Fixed-point decimal implementation written in Rust suitable
-//! for wide range og financial calculations that require significant
+//! for a wide range of financial calculations that require significant
 //! integral and fractional digits to follow decimal arithmetic rounding.
 //!
 //! The binary representation consists of a 64 bit integer number,
@@ -10,11 +10,11 @@
 //! which are implemented as native operations on i64. These operations also
 //! don't result in any rounding errors.
 //!
-//! Multiplications and division are also relatively efficient and implemented
+//! Multiplication and division are also relatively efficient and implemented
 //! via operations on i128 type internally. On some platforms (like x86-64) where
 //! 64 x 64 bit multiplication with 128 bit result and division of 128 bit integer
 //! by 64 bit are implemented as native instructions, performance penalty compared
-//! to regular i64 division and multiplication is negligent.
+//! to regular i64 division and multiplication is negligible.
 //!
 //! While 4 fractional decimal digits handles most of cases for accounting and tax
 //! computations, in some cases like exchange rates higher precision is desirable.
@@ -23,29 +23,30 @@
 //! ## Usage
 //!
 //! The stable version of rust requires you to create a Decimal number
-//! using one of it's convenience methods.
+//! using one of its convenience methods.
 //!
 //! ```rust
-//! use fast_decimal::Amount64;
+//! use fin_decimal::Amount64;
 //! use core::str::FromStr;
 //!
 //! // Using an integer number.
-//! let from_f64 = Amount64::from(3); // 3.0000
+//! let from_int = Amount64::from(3); // 3.0000
 //!
-//! // Using an floating point number.
+//! // Using a floating point number.
 //! let from_f64 = Amount64::from(2.02f64); // 2.0200
 //!
 //! // From a string representation
 //! let from_string = Amount64::from_str("2.02").unwrap(); // 2.0200
 //!
 //! // Using the `Into` trait
+#![warn(missing_docs)]
 //! let my_int : Amount64 = 3i32.into();
 //! ```
 //!
 
 //#![cfg_attr(feature = "no_std", no_std)]
 //#![cfg_attr(feature = "asm", feature(llvm_asm))]
-#![crate_name = "fast_decimal"]
+#![crate_name = "fin_decimal"]
 #![crate_type = "lib"]
 #![no_std]
 #![deny(unconditional_recursion)]
@@ -91,6 +92,7 @@ pub enum AmountErrorKind {
 }
 
 impl AmountErrorKind {
+    /// Returns the kind of the error.
     pub fn kind(&self) -> &AmountErrorKind {
         self
     }
@@ -364,12 +366,17 @@ fn test_ipow10() {
         p *= 10;
     }
 }
+/// Defines how to display the sign of the parsed number.
 pub enum AmountSign {
+    /// Omit the sign entirely.
     None,
+    /// Display only the negative sign.
     Negative,
+    /// Always display the sign (+ or -).
     Always,
 }
 
+/// Converts an i64 to a fixed-point string representation, optionally padded.
 pub fn str_i64(
     num: i64,
     frac_digit: usize,
@@ -628,10 +635,10 @@ fn fmt_i64(num: i64, frac_digit: usize, f: &mut fmt::Formatter) -> fmt::Result {
 
 /// Converts a string in base 10 to a fixed-point scaled value.
 /// Can be used with non-default scale to handle higher precision
-/// exchange rates and other scenarious with longer fractional part.
+/// exchange rates and other scenarios with longer fractional parts.
 pub fn parse_decimal_i64(src: &str, scale: u8) -> Result<i64, AmountErrorKind> {
     // all valid digits are ascii, so we will just iterate over the utf8 bytes
-    // and cast them to chars.Takes the reciprocal (inverse) of a number, 1/x.
+    // and cast them to chars.
     let src: &[u8] = src.as_bytes();
     // temporarily result
     let scale = scale as i64;
@@ -731,27 +738,35 @@ pub fn parse_decimal_i64(src: &str, scale: u8) -> Result<i64, AmountErrorKind> {
 /// `Rounding::Up` - Always round up.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Rounding {
+    /// Rounds toward the nearest even number, e.g. 5.5 -> 6, 4.5 -> 4
     HalfEven,
+    /// Rounds up if the value >= 5, otherwise rounds down, e.g. 6.5 -> 7 (default)
     HalfUp,
+    /// Rounds down if the value <= 5, otherwise rounds up, e.g. 4.5 -> 4, 4.51 -> 5
     HalfDown,
+    /// Always rounds down.
     Down,
+    /// Always rounds up.
     Up,
 }
 
-/// Amount64 type implements decimal fixed-point arithmetics for financial computations.
+/// Amount64 type implements decimal fixed-point arithmetic for financial computations.
 /// It is implemented to be as efficient as possible with most common add/sub operations
 /// to be native binary add/sub.
 /// Actual decimal processing is needed for multiplication and division where rounding
 /// should follow specific rules.
-/// Number of decimal points is choosen to be 4 - this seems to be enough for most use cases
+/// Number of decimal points is chosen to be 4 - this seems to be enough for most use cases
 /// except for exchange rates where sometimes up to 8 decimal digits is required
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Decimal<const DIGITS: u8>(pub i64);
 
+/// Amount64 is a 64-bit integer based decimal type with 4 decimal digits precision.
 pub type Amount64 = Decimal<4>;
+/// Rate64 is a 64-bit integer based decimal type with 8 decimal digits precision.
 pub type Rate64 = Decimal<8>;
 
 impl<const DIGITS: u8> Decimal<DIGITS> {
+    /// The multiplier used to scale values up. Equal to 10^DIGITS.
     pub const SCALE_INT: i64 = ipow10(DIGITS as i64);
 
     /// The largest value that can be represented by this type.
@@ -771,22 +786,27 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// The largest integer value that can be represented by this type.
     pub const INT_MAX: i64 = i64::MAX / Self::SCALE_INT;
 
+    /// The smallest f64 value that can be represented.
     pub const F64_MIN: f64 = (i64::MIN + 1) as f64 / Self::SCALE_INT as f64; // -922337203685477.5807f64;
+    /// The largest f64 value that can be represented.
     pub const F64_MAX: f64 = i64::MAX as f64 / Self::SCALE_INT as f64; //922337203685477.5807f64;
 
+    /// Half of the scaling factor, used for rounding.
     pub const SCALE_INT_HALF: i64 = Self::SCALE_INT / 2;
 
+    /// The multiplier used to scale values up, as f64.
     pub const SCALE_F64: f64 = Self::SCALE_INT as f64;
 
-    // scale factor for 1/100 of unit
+    /// Scale factor for 1/100 of unit.
     pub const SCALE_INT_100: i64 = Self::SCALE_INT / 100;
+    /// Half of scale factor for 1/100 of unit.
     pub const SCALE_INT_HALF_100: i64 = Self::SCALE_INT_100 / 2;
 
     /// Constructs a new decimal integer with value 0.
     ///
     /// # Examples
     /// ```rust
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let i = Amount64::new();
     /// ```
     #[inline]
@@ -794,11 +814,13 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         Decimal::<DIGITS>(0)
     }
 
+    /// Tries to convert a f32 to a Decimal.
     #[inline]
     pub fn from_f32(val: f32) -> Result<Self, AmountErrorKind> {
         Self::from_f64(val as f64)
     }
 
+    /// Tries to convert a f64 to a Decimal.
     #[inline]
     pub fn from_f64(val: f64) -> Result<Self, AmountErrorKind> {
         if (Self::F64_MIN..=Self::F64_MAX).contains(&val) {
@@ -808,6 +830,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         }
     }
 
+    /// Tries to convert an i64 to a Decimal.
     #[inline]
     pub const fn from_i64(val: i64) -> Result<Self, AmountErrorKind> {
         if (val <= Self::INT_MAX) && (val >= Self::INT_MIN) {
@@ -817,12 +840,14 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         }
     }
 
+    /// Converts the Decimal back into an f64.
     #[inline]
     pub fn to_f64(self) -> f64 {
         // use division as 0.0001 doesn't have exact representation in f64
         self.0 as f64 / Self::SCALE_F64
     }
 
+    /// Converts the Decimal back into an i64 (truncating the fractional part).
     #[inline]
     pub const fn to_i64(self) -> i64 {
         self.0 / Self::SCALE_INT
@@ -832,7 +857,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     ///
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let f = Amount64::from(3);
     /// let g = Amount64::from(-4);
     ///
@@ -913,7 +938,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     ///
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let f = Amount64::from_f64(3.7_f64).unwrap();
     /// let g = Amount64::from_f64(3.0_f64).unwrap();
     /// let h = Amount64::from_f64(-3.7_f64).unwrap();
@@ -932,7 +957,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     ///
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let f = Amount64::from_f64(3.7_f64).unwrap();
     /// let g = Amount64::from_f64(3.0_f64).unwrap();
     /// let h = Amount64::from_f64(-3.7_f64).unwrap();
@@ -956,7 +981,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     ///
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let f = Amount64::from_f64(3.01_f64).unwrap();
     /// let g = Amount64::from_f64(4.0_f64).unwrap();
     ///
@@ -983,7 +1008,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     ///
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let f = Amount64::from(3.3_f64);
     /// let g = Amount64::from(-3.3_f64);
     ///
@@ -1008,7 +1033,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     ///
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// assert_eq!(Amount64::from(3.356_f64).round100(), Amount64::from(3.36_f64));
     /// assert_eq!(Amount64::from(3.354_f64).round100(), Amount64::from(3.35_f64));
     /// ```
@@ -1181,20 +1206,13 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         match mode {
             Rounding::HalfEven => {
                 let is_even = quo % 2 == 0;
-                if rem > half || (rem == half && !is_even_div) {
+                if rem > half || (rem == half && (!is_even_div || !is_even)) {
                     if is_neg {
                         sub_one = true;
                     } else {
                         add_one = true;
                     }
-                } else if rem == half && is_even_div
-                    && !is_even {
-                        if is_neg {
-                            sub_one = true;
-                        } else {
-                            add_one = true;
-                        }
-                    }
+                }
             }
             Rounding::HalfUp => {
                 if rem > half || (rem == half && is_even_div) {
@@ -1241,7 +1259,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     ///
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let x = Amount64::from(3.6_f64);
     /// let y = Amount64::from(-3.6_f64);
     /// let abs_difference_x = (x.fract() - 0.6).abs();
@@ -1259,7 +1277,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// assert_eq!(Amount64::from(10).is_positive(), true);
     /// assert_eq!(Amount64::from(-10).is_positive(), false);
     /// ```
@@ -1272,7 +1290,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// assert_eq!(Amount64::from(10).is_negative(), false);
     /// assert_eq!(Amount64::from(-10).is_negative(), true);
     /// ```
@@ -1289,7 +1307,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     ///
     /// # Examples
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// assert_eq!(Amount64::from(10).signum(), Amount64::ONE);
     /// assert_eq!(Amount64::from(-10).signum(), Amount64::MINUS_ONE);
     /// assert_eq!(Amount64::from(0).signum(), Amount64::ZERO);
@@ -1309,7 +1327,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// which attempts to preserve the numeric value, and not the bitwise value.
     /// # Examples
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// assert!(Amount64::from(1.0).to_bits() != 1.0 as u64); // to_bits() is not casting!
     /// assert_eq!(Amount64::from(2.5).to_bits(), (Amount64::SCALE_INT*2 + Amount64::SCALE_INT_HALF) as u64);
     /// ```
@@ -1322,7 +1340,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// This is currently identical to transmute::<u64, f64>(v) on all platforms.
     /// # Examples
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// assert_eq!(Amount64::from_bits((Amount64::SCALE_INT*2 + Amount64::SCALE_INT_HALF) as u64), Amount64::from(2.5));
     /// ```
     #[inline]
@@ -1334,7 +1352,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
 
     /// Reverses the byte order of the Amount64. Primary use case - serialization.
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let n = Amount64::from_bits(0x1234567890123456u64);
     /// let m = n.swap_bytes();
     /// assert_eq!(m.to_bits(), 0x5634129078563412);
@@ -1348,7 +1366,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let bytes = Amount64::from_bits(0x1234567890123456u64).to_be_bytes();
     /// assert_eq!(bytes, [0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56]);
     /// ```
@@ -1361,7 +1379,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let bytes = Amount64::from_bits(0x1234567890123456u64).to_le_bytes();
     /// assert_eq!(bytes, [0x56, 0x34, 0x12, 0x90, 0x78, 0x56, 0x34, 0x12]);
     /// ```
@@ -1376,7 +1394,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let bytes = Amount64::from_bits(0x1234567890123456u64).to_le_bytes();
     /// assert_eq!(bytes,
     /// if cfg!(target_endian = "big") {
@@ -1410,7 +1428,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let value = Amount64::from_ne_bytes(if cfg!(target_endian = "big") {
     ///                 [0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56]
     ///             } else {
@@ -1434,7 +1452,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let value = Amount64::from_be_bytes([0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56]);
     /// assert_eq!(value,Amount64::from_bits(0x1234567890123456u64));
     /// ```
@@ -1448,7 +1466,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let value = Amount64::from_le_bytes([0x56, 0x34, 0x12, 0x90, 0x78, 0x56, 0x34, 0x12]);
     /// assert_eq!(value,Amount64::from_bits(0x1234567890123456u64));
     /// ```
@@ -1462,7 +1480,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     ///
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// let x = Amount64::from(2.0_f64);
     /// let abs_difference = (x.powi(2) - (x * x)).abs();
     ///
@@ -1504,7 +1522,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Examples
     ///
     /// ```
-    /// use fast_decimal::Amount64;
+    /// use fin_decimal::Amount64;
     /// assert_eq!(Amount64::from(2).clamp(Amount64::MINUS_ONE,Amount64::ONE), Amount64::ONE);
     /// assert_eq!(Amount64::from(0).clamp(Amount64::MINUS_ONE,Amount64::ONE), Amount64::ZERO);
     /// ```

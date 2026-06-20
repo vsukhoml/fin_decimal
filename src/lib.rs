@@ -1074,10 +1074,9 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
                     if !is_even {
                         add_one = true;
                     }
-                } else if frac == -half
-                    && !is_even {
-                        sub_one = true;
-                    }
+                } else if frac == -half && !is_even {
+                    sub_one = true;
+                }
             }
             Rounding::HalfUp => {
                 let half = Decimal::<DIGITS>::SCALE_INT_HALF;
@@ -1141,10 +1140,9 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
                     if !is_even {
                         add_one = true;
                     }
-                } else if rem == -half
-                    && !is_even {
-                        sub_one = true;
-                    }
+                } else if rem == -half && !is_even {
+                    sub_one = true;
+                }
             }
             Rounding::HalfUp => {
                 if rem >= half {
@@ -1540,21 +1538,13 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// Returns the minimum of the two numbers.
     #[inline]
     pub fn min(self, other: Self) -> Self {
-        if self <= other {
-            self
-        } else {
-            other
-        }
+        if self <= other { self } else { other }
     }
 
     /// Returns the maximum of the two numbers.
     #[inline]
     pub fn max(self, other: Self) -> Self {
-        if self >= other {
-            self
-        } else {
-            other
-        }
+        if self >= other { self } else { other }
     }
 }
 
@@ -1955,6 +1945,36 @@ impl<const DIGITS: u8> fmt::Display for Decimal<DIGITS> {
     }
 }
 
+#[cfg(feature = "ufmt")]
+impl<const DIGITS: u8> ufmt::uDisplay for Decimal<DIGITS> {
+    fn fmt<W>(&self, f: &mut ufmt::Formatter<'_, W>) -> Result<(), W::Error>
+    where
+        W: ufmt::uWrite + ?Sized,
+    {
+        let mut buf = [0u8; 3 * core::mem::size_of::<i64>()];
+        match str_i64(
+            self.0,
+            DIGITS as usize,
+            None,
+            AmountSign::Negative,
+            &mut buf,
+        ) {
+            Some(s) => f.write_str(s),
+            None => f.write_str("Amount::ERROR"),
+        }
+    }
+}
+
+#[cfg(feature = "ufmt")]
+impl<const DIGITS: u8> ufmt::uDebug for Decimal<DIGITS> {
+    fn fmt<W>(&self, f: &mut ufmt::Formatter<'_, W>) -> Result<(), W::Error>
+    where
+        W: ufmt::uWrite + ?Sized,
+    {
+        f.debug_tuple("Decimal")?.field(&self.0)?.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -2302,5 +2322,32 @@ mod tests {
             Some(Amount64::from(1))
         );
         assert_eq!(Amount64::from(2).checked_div(Amount64::from(0)), None);
+    }
+
+    #[cfg(feature = "ufmt")]
+    #[test]
+    fn test_ufmt() {
+        struct StringWriter(std::string::String);
+        impl ufmt::uWrite for StringWriter {
+            type Error = core::convert::Infallible;
+            fn write_str(&mut self, s: &str) -> Result<(), Self::Error> {
+                self.0.push_str(s);
+                Ok(())
+            }
+        }
+
+        let mut w1 = StringWriter(std::string::String::new());
+        let val1 = Decimal::<4>(10000);
+        ufmt::uwrite!(&mut w1, "{}", val1).unwrap();
+        assert_eq!(w1.0, "1");
+
+        let mut w2 = StringWriter(std::string::String::new());
+        let val2 = Decimal::<4>(-10001);
+        ufmt::uwrite!(&mut w2, "{}", val2).unwrap();
+        assert_eq!(w2.0, "-1.0001");
+
+        let mut w3 = StringWriter(std::string::String::new());
+        ufmt::uwrite!(&mut w3, "{:?}", val2).unwrap();
+        assert_eq!(w3.0, "Decimal(-10001)");
     }
 }

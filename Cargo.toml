@@ -1,9 +1,9 @@
 [package]
 name = "fin_decimal"
 description = "A high-performance decimal fixed-point arithmetic library for financial applications"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Vadim Sukhomlinov <vadim.sukhomlinov@gmail.com>"]
-edition = "2021"
+edition = "2024"
 license = "BSD-4-Clause"
 readme = "README.md"
 keywords = ["decimal","math","number", "fixed-point"]
@@ -25,6 +25,7 @@ path = "src/lib.rs"
 
 [dependencies]
 serde = { version = "1.0", optional = true, default-features = false }
+ufmt = { version = "0.2.0", optional = true, default-features = false }
 
 [features]
 unstable = [] # To keep travis-cargo happy

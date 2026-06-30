@@ -89,6 +89,12 @@ pub enum AmountErrorKind {
     InvalidDigit,
     /// Value is too large to store in target integer type.
     Overflow,
+    /// Value cannot be represented exactly at the target decimal scale.
+    ///
+    /// Constructed when a value has more fractional digits than the target type
+    /// can hold, so converting it would silently drop precision (e.g. building a
+    /// 4-digit `Amount64` from `(mantissa: 1, exponent: -5)`).
+    Inexact,
 }
 
 impl AmountErrorKind {
@@ -102,6 +108,7 @@ impl AmountErrorKind {
             AmountErrorKind::Empty => "cannot parse integer from empty string",
             AmountErrorKind::InvalidDigit => "invalid symbol found in string",
             AmountErrorKind::Overflow => "number too large to fit in target type",
+            AmountErrorKind::Inexact => "value cannot be represented exactly at the target scale",
         }
     }
 }
@@ -349,6 +356,25 @@ const fn ipow10(pow: i64) -> i64 {
         (_, true) => 0, // overflow
         (_, _) => P10[pow as usize - 1],
     }
+}
+
+#[inline]
+// Compute 10^pow as i128 for non-negative `pow`.
+// Returns `None` if `pow` is negative or the result overflows i128.
+const fn ipow10_i128(pow: i64) -> Option<i128> {
+    if pow < 0 {
+        return None;
+    }
+    let mut result: i128 = 1;
+    let mut i = 0i64;
+    while i < pow {
+        result = match result.checked_mul(10) {
+            Some(v) => v,
+            None => return None,
+        };
+        i += 1;
+    }
+    Some(result)
 }
 
 #[test]
@@ -636,7 +662,26 @@ fn fmt_i64(num: i64, frac_digit: usize, f: &mut fmt::Formatter) -> fmt::Result {
 /// Converts a string in base 10 to a fixed-point scaled value.
 /// Can be used with non-default scale to handle higher precision
 /// exchange rates and other scenarios with longer fractional parts.
+///
+/// Fractional digits beyond `scale` are dropped with `Rounding::HalfUp`. Use
+/// [`parse_decimal_i64_rounded`] to choose a different rounding mode.
 pub fn parse_decimal_i64(src: &str, scale: u8) -> Result<i64, AmountErrorKind> {
+    parse_decimal_i64_rounded(src, scale, Rounding::HalfUp)
+}
+
+/// Converts a string in base 10 to a fixed-point scaled value, rounding any
+/// fractional digits beyond `scale` with the given [`Rounding`] mode.
+///
+/// Inputs that carry more precision than `scale` can hold are accepted (never an
+/// error) and rounded; trailing zeros are dropped exactly. The rounding is
+/// "correct" in the IEEE sense: it inspects the first dropped digit together with
+/// a sticky flag (whether any further digit is non-zero) and, for `HalfEven`, the
+/// parity of the retained value.
+pub fn parse_decimal_i64_rounded(
+    src: &str,
+    scale: u8,
+    mode: Rounding,
+) -> Result<i64, AmountErrorKind> {
     // all valid digits are ascii, so we will just iterate over the utf8 bytes
     // and cast them to chars.
     let src: &[u8] = src.as_bytes();
@@ -646,6 +691,8 @@ pub fn parse_decimal_i64(src: &str, scale: u8) -> Result<i64, AmountErrorKind> {
     let mut intpart: i64 = 0; // integer part if decimal point present
     let mut point: i64 = 0; // flag and counter for decimal point digits
     let mut digit = false; // true if there was any digit
+    let mut round_digit: i64 = 0; // first fractional digit dropped beyond `scale`
+    let mut sticky = false; // any non-zero digit beyond `round_digit`
     let int_scale: i64 = ipow10(scale);
 
     if src.is_empty() {
@@ -690,10 +737,12 @@ pub fn parse_decimal_i64(src: &str, scale: u8) -> Result<i64, AmountErrorKind> {
                         Some(result) => result,
                         None => return Err(AmountErrorKind::Overflow),
                     }
-                } else if point == (scale + 1) && (x >= 5) {
-                    // for first digit beyond resolution of type apply decimal rounding
-                    // TODO: implement round to even? Is it even needed?
-                    result += 1
+                } else if point == (scale + 1) {
+                    // first digit beyond the resolution of the type
+                    round_digit = x;
+                } else if x != 0 {
+                    // any further non-zero digit sets the sticky flag
+                    sticky = true;
                 }
                 if point > 0 {
                     point += 1 // count numbers after decimal point
@@ -715,6 +764,23 @@ pub fn parse_decimal_i64(src: &str, scale: u8) -> Result<i64, AmountErrorKind> {
         Some(result) => result,
         None => return Err(AmountErrorKind::Overflow),
     };
+
+    // apply the rounding mode to the dropped fractional digits. `result` here is
+    // the magnitude (sign is applied last); a carry into the integer part is
+    // absorbed naturally since `result == int_scale` represents exactly 1.0.
+    let round_up = match mode {
+        Rounding::HalfUp => round_digit >= 5,
+        Rounding::HalfDown => round_digit > 5 || (round_digit == 5 && sticky),
+        Rounding::HalfEven => round_digit > 5 || (round_digit == 5 && (sticky || result % 2 != 0)),
+        Rounding::Down => false,
+        Rounding::Up => round_digit != 0 || sticky,
+    };
+    if round_up {
+        result = match result.checked_add(1) {
+            Some(result) => result,
+            None => return Err(AmountErrorKind::Overflow),
+        };
+    }
 
     // combine integer and fractional parts
     result = match result.checked_add(intpart) {
@@ -766,6 +832,14 @@ pub type Amount64 = Decimal<4>;
 pub type Rate64 = Decimal<8>;
 
 impl<const DIGITS: u8> Decimal<DIGITS> {
+    /// The decimal scale: the number of fractional digits.
+    ///
+    /// A stable name for the scale that is independent of the const-generic
+    /// `DIGITS` parameter. It survives the eventual move off the const-generic
+    /// form (when `Decimal` becomes a trait or a wider concrete type, `DIGITS`
+    /// disappears but `SCALE` stays).
+    pub const SCALE: i32 = DIGITS as i32;
+
     /// The multiplier used to scale values up. Equal to 10^DIGITS.
     pub const SCALE_INT: i64 = ipow10(DIGITS as i64);
 
@@ -851,6 +925,225 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     #[inline]
     pub const fn to_i64(self) -> i64 {
         self.0 / Self::SCALE_INT
+    }
+
+    /// Returns the raw backing value widened to `i128`.
+    ///
+    /// This is the unscaled mantissa: the stored integer such that the value
+    /// equals `mantissa * 10^(-SCALE)`. The return type is deliberately `i128`,
+    /// not the current `i64` backing, so this signature stays stable when the
+    /// backing integer widens (`i64` → `i128` → …).
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::Amount64;
+    /// let a = Amount64::from(3); // SCALE = 4
+    /// assert_eq!(a.mantissa(), 30000);
+    /// ```
+    #[inline]
+    pub const fn mantissa(self) -> i128 {
+        self.0 as i128
+    }
+
+    /// Decomposes the value into `(mantissa, exponent)` such that the value
+    /// equals `mantissa * 10^exponent`.
+    ///
+    /// The exponent is always `-SCALE`. This is the symmetric counterpart of
+    /// [`from_decimal_parts`](Self::from_decimal_parts) and lets serialization
+    /// codecs encode without reaching into the backing field directly.
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::Amount64;
+    /// let a = Amount64::from(3); // SCALE = 4
+    /// assert_eq!(a.to_decimal_parts(), (30000, -4));
+    /// ```
+    #[inline]
+    pub const fn to_decimal_parts(self) -> (i128, i32) {
+        (self.0 as i128, -Self::SCALE)
+    }
+
+    /// Builds a value from `(mantissa, exponent)`, where the represented number
+    /// is `mantissa * 10^exponent`.
+    ///
+    /// The value is rescaled to this type's fixed [`SCALE`](Self::SCALE):
+    /// * If it needs to be scaled up (more fractional capacity than the input),
+    ///   the mantissa is multiplied by the appropriate power of ten; an
+    ///   [`Overflow`](AmountErrorKind::Overflow) is returned if the result does
+    ///   not fit the backing integer.
+    /// * If it needs to be scaled down (the input carries more fractional digits
+    ///   than this type can hold), the conversion is **exact-or-error**: it
+    ///   succeeds only when the dropped digits are all zero, otherwise an
+    ///   [`Inexact`](AmountErrorKind::Inexact) is returned.
+    ///
+    /// This is the inverse of [`to_decimal_parts`](Self::to_decimal_parts) and
+    /// the single place where the backing-int range check lives, so widening the
+    /// backing only relaxes the check here and leaves callers untouched.
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount64, AmountErrorKind};
+    /// // 1.23 expressed as 123 * 10^-2, retargeted to SCALE = 4.
+    /// assert_eq!(Amount64::from_decimal_parts(123, -2), Ok(Amount64::from(123) / Amount64::from(100)));
+    /// // Round-trip of an existing value.
+    /// let a = Amount64::from(7);
+    /// let (m, e) = a.to_decimal_parts();
+    /// assert_eq!(Amount64::from_decimal_parts(m, e), Ok(a));
+    /// // More fractional digits than a 4-digit type can hold: rejected.
+    /// assert_eq!(Amount64::from_decimal_parts(1, -5), Err(AmountErrorKind::Inexact));
+    /// ```
+    pub const fn from_decimal_parts(
+        mantissa: i128,
+        exponent: i32,
+    ) -> Result<Self, AmountErrorKind> {
+        // Zero is exactly representable at any exponent; short-circuit before
+        // computing powers of ten that may overflow for extreme exponents.
+        if mantissa == 0 {
+            return Ok(Decimal::<DIGITS>(0));
+        }
+        // Decimal places to shift the mantissa by to reach this type's scale.
+        // Widen to i64 so the addition cannot overflow regardless of `exponent`.
+        let shift = exponent as i64 + Self::SCALE as i64;
+        let scaled = if shift >= 0 {
+            // Scale up: mantissa * 10^shift.
+            let factor = match ipow10_i128(shift) {
+                Some(f) => f,
+                None => return Err(AmountErrorKind::Overflow),
+            };
+            match mantissa.checked_mul(factor) {
+                Some(v) => v,
+                None => return Err(AmountErrorKind::Overflow),
+            }
+        } else {
+            // Scale down: mantissa / 10^(-shift), but only if exact.
+            let divisor = match ipow10_i128(-shift) {
+                Some(d) => d,
+                // 10^(-shift) exceeds i128, yet the mantissa is non-zero here:
+                // the value carries far more precision than this type can hold.
+                None => return Err(AmountErrorKind::Inexact),
+            };
+            if mantissa % divisor != 0 {
+                return Err(AmountErrorKind::Inexact);
+            }
+            mantissa / divisor
+        };
+        // Fit into the backing integer.
+        if scaled < i64::MIN as i128 || scaled > i64::MAX as i128 {
+            return Err(AmountErrorKind::Overflow);
+        }
+        Ok(Decimal::<DIGITS>(scaled as i64))
+    }
+
+    /// Builds a value from `(mantissa, exponent)`, rounding to this type's scale
+    /// with the given [`Rounding`] mode when the input carries more fractional
+    /// digits than can be held exactly.
+    ///
+    /// This is the deliberately-inexact counterpart of
+    /// [`from_decimal_parts`](Self::from_decimal_parts): it never returns
+    /// [`Inexact`](AmountErrorKind::Inexact). The only failure mode is
+    /// [`Overflow`](AmountErrorKind::Overflow), when the value does not fit the
+    /// backing integer. Scaling *up* is always exact, so the rounding mode only
+    /// matters when digits are dropped.
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount64, Rounding};
+    /// // 1.23456 has more than 4 fractional digits; round half-up to 1.2346.
+    /// assert_eq!(
+    ///     Amount64::from_decimal_parts_rounded(123456, -5, Rounding::HalfUp),
+    ///     Ok(Amount64::from(12346) / Amount64::from(10000)),
+    /// );
+    /// // Trailing zeros are dropped exactly regardless of mode.
+    /// assert_eq!(
+    ///     Amount64::from_decimal_parts_rounded(1_230_000, -6, Rounding::Down),
+    ///     Amount64::from_decimal_parts(1_230_000, -6),
+    /// );
+    /// ```
+    pub const fn from_decimal_parts_rounded(
+        mantissa: i128,
+        exponent: i32,
+        mode: Rounding,
+    ) -> Result<Self, AmountErrorKind> {
+        if mantissa == 0 {
+            return Ok(Decimal::<DIGITS>(0));
+        }
+        let shift = exponent as i64 + Self::SCALE as i64;
+        let scaled = if shift >= 0 {
+            // Scale up: always exact.
+            let factor = match ipow10_i128(shift) {
+                Some(f) => f,
+                None => return Err(AmountErrorKind::Overflow),
+            };
+            match mantissa.checked_mul(factor) {
+                Some(v) => v,
+                None => return Err(AmountErrorKind::Overflow),
+            }
+        } else {
+            let is_neg = mantissa < 0;
+            // `unsigned_abs` avoids the `i128::MIN` overflow that `abs` would hit.
+            let mag = mantissa.unsigned_abs();
+            let divisor = match ipow10_i128(-shift) {
+                Some(d) => d as u128,
+                // 10^(-shift) > i128::MAX >= mag, so |value| < 0.5 ULP: rounds to
+                // 0, except `Up` rounds away from zero to one ULP.
+                None => {
+                    let one = match mode {
+                        Rounding::Up => {
+                            if is_neg {
+                                -1
+                            } else {
+                                1
+                            }
+                        }
+                        _ => 0,
+                    };
+                    return Ok(Decimal::<DIGITS>(one));
+                }
+            };
+            let quo = mag / divisor;
+            let rem = mag % divisor;
+            // The divisor is a power of ten >= 10, hence always even: `half` is an
+            // exact tie threshold.
+            let half = divisor / 2;
+            let round_up = match mode {
+                Rounding::HalfEven => rem > half || (rem == half && !quo.is_multiple_of(2)),
+                Rounding::HalfUp => rem >= half,
+                Rounding::HalfDown => rem > half,
+                Rounding::Down => false,
+                Rounding::Up => rem != 0,
+            };
+            let q = if round_up { quo + 1 } else { quo } as i128;
+            if is_neg { -q } else { q }
+        };
+        if scaled < i64::MIN as i128 || scaled > i64::MAX as i128 {
+            return Err(AmountErrorKind::Overflow);
+        }
+        Ok(Decimal::<DIGITS>(scaled as i64))
+    }
+
+    /// Parses a decimal string, rounding any fractional digits beyond this
+    /// type's scale with the given [`Rounding`] mode.
+    ///
+    /// Like [`FromStr`], but with explicit control over how excess precision is
+    /// rounded. [`FromStr`]/[`From<&str>`](From) use [`Rounding::HalfUp`].
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount64, Rounding};
+    /// // Five fractional digits into a 4-digit type, rounded to even.
+    /// assert_eq!(
+    ///     Amount64::from_str_rounded("1.23455", Rounding::HalfEven),
+    ///     Ok(Amount64::from(12346) / Amount64::from(10000)),
+    /// );
+    /// assert_eq!(
+    ///     Amount64::from_str_rounded("1.23465", Rounding::HalfEven),
+    ///     Ok(Amount64::from(12346) / Amount64::from(10000)),
+    /// );
+    /// ```
+    pub fn from_str_rounded(src: &str, mode: Rounding) -> Result<Self, AmountErrorKind> {
+        Ok(Decimal::<DIGITS>(parse_decimal_i64_rounded(
+            src, DIGITS, mode,
+        )?))
     }
 
     /// Computes the absolute value of self.
@@ -1983,6 +2276,212 @@ mod tests {
     use crate::Decimal;
     use core::str::FromStr;
     use std::format;
+
+    #[test]
+    fn test_decimal_parts_roundtrip() {
+        // mantissa() / to_decimal_parts() expose the raw scaled value.
+        let a = Amount64::from(3);
+        assert_eq!(a.mantissa(), 30000);
+        assert_eq!(a.to_decimal_parts(), (30000, -4));
+        assert_eq!(Amount64::SCALE, 4);
+        assert_eq!(Decimal::<8>::SCALE, 8);
+        assert_eq!(Decimal::<0>::SCALE, 0);
+
+        // Round-trip through (mantissa, exponent) for several values.
+        for raw in [0i64, 1, -1, 12345, -98765, i64::MAX, -i64::MAX] {
+            let d = Decimal::<4>(raw);
+            let (m, e) = d.to_decimal_parts();
+            assert_eq!(Amount64::from_decimal_parts(m, e), Ok(d));
+        }
+    }
+
+    #[test]
+    fn test_from_decimal_parts_scaling() {
+        // Scale up: 1.23 == 123 * 10^-2 retargeted to 4 digits == 12300.
+        assert_eq!(
+            Amount64::from_decimal_parts(123, -2),
+            Ok(Decimal::<4>(12300))
+        );
+        // Exponent equal to scale: integer scaling.
+        assert_eq!(Amount64::from_decimal_parts(7, 0), Ok(Decimal::<4>(70000)));
+        // Positive exponent scales further up.
+        assert_eq!(
+            Amount64::from_decimal_parts(5, 2),
+            Ok(Decimal::<4>(5_000_000))
+        );
+        // Zero with any exponent is always representable.
+        assert_eq!(Amount64::from_decimal_parts(0, -100), Ok(Decimal::<4>(0)));
+        assert_eq!(Amount64::from_decimal_parts(0, 100), Ok(Decimal::<4>(0)));
+
+        // Exact scale-down: surplus trailing zeros are droppable.
+        // 1230000 * 10^-6 == 1.23 == 12300 * 10^-4.
+        assert_eq!(
+            Amount64::from_decimal_parts(1_230_000, -6),
+            Ok(Decimal::<4>(12300))
+        );
+    }
+
+    #[test]
+    fn test_from_decimal_parts_inexact() {
+        // More fractional digits than a 4-digit type can hold.
+        assert_eq!(
+            Amount64::from_decimal_parts(1, -5),
+            Err(AmountErrorKind::Inexact)
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts(12345, -5),
+            Err(AmountErrorKind::Inexact)
+        );
+        // Huge negative exponent with non-zero mantissa: inexact, not a panic.
+        assert_eq!(
+            Amount64::from_decimal_parts(1, -1000),
+            Err(AmountErrorKind::Inexact)
+        );
+
+        // Trailing zeros after the representable digits are NOT inexact: the
+        // dropped digits are all zero, so the value is exact.
+        assert_eq!(
+            Amount64::from_decimal_parts(12300, -5),
+            Ok(Decimal::<4>(1230)) // 0.12300 -> 0.1230
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts(120_000, -5),
+            Ok(Decimal::<4>(12000)) // 1.20000 -> 1.2000
+        );
+        // Many surplus zeros are still exact.
+        assert_eq!(
+            Amount64::from_decimal_parts(50_000_000, -10),
+            Ok(Decimal::<4>(50)) // 0.0050000000 -> 0.0050
+        );
+    }
+
+    #[test]
+    fn test_from_decimal_parts_rounded() {
+        use crate::Rounding::*;
+        // 1.23456 -> 4 digits. Round digit is 6 (> half).
+        for mode in [HalfEven, HalfUp, HalfDown, Up] {
+            assert_eq!(
+                Amount64::from_decimal_parts_rounded(123456, -5, mode),
+                Ok(Decimal::<4>(12346))
+            );
+        }
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(123456, -5, Down),
+            Ok(Decimal::<4>(12345))
+        );
+
+        // Exact half: 1.23455 -> last kept digit decides HalfEven/HalfDown.
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(123455, -5, HalfUp),
+            Ok(Decimal::<4>(12346))
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(123455, -5, HalfDown),
+            Ok(Decimal::<4>(12345))
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(123455, -5, HalfEven),
+            Ok(Decimal::<4>(12346)) // 12345 is odd -> round to even 12346
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(123465, -5, HalfEven),
+            Ok(Decimal::<4>(12346)) // 12346 is even -> stays
+        );
+
+        // Negative values round away from / toward zero symmetrically.
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(-123456, -5, HalfUp),
+            Ok(Decimal::<4>(-12346))
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(-123456, -5, Down),
+            Ok(Decimal::<4>(-12345))
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(-123451, -5, Up),
+            Ok(Decimal::<4>(-12346))
+        );
+
+        // Exact inputs are unaffected by the mode.
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(1_230_000, -6, Down),
+            Ok(Decimal::<4>(12300))
+        );
+
+        // Magnitude below half a ULP: rounds to zero, except `Up`.
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(1, -1000, HalfUp),
+            Ok(Decimal::<4>(0))
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(1, -1000, Up),
+            Ok(Decimal::<4>(1))
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(-1, -1000, Up),
+            Ok(Decimal::<4>(-1))
+        );
+
+        // Overflow still reported when the rounded value won't fit.
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(i128::MAX, 0, HalfUp),
+            Err(AmountErrorKind::Overflow)
+        );
+    }
+
+    #[test]
+    fn test_parse_rounded() {
+        use crate::Rounding::*;
+        use crate::parse_decimal_i64_rounded;
+
+        // Default parse / FromStr keep HalfUp behavior.
+        assert_eq!(Amount64::from_str("1.23455"), Ok(Decimal::<4>(12346)));
+
+        // HalfEven uses the sticky bit and parity of the kept digit.
+        assert_eq!(parse_decimal_i64_rounded("1.23455", 4, HalfEven), Ok(12346));
+        assert_eq!(parse_decimal_i64_rounded("1.23465", 4, HalfEven), Ok(12346));
+        // 1.234551 is past the half -> always up regardless of parity.
+        assert_eq!(
+            parse_decimal_i64_rounded("1.234551", 4, HalfEven),
+            Ok(12346)
+        );
+        // HalfDown drops an exact half but rounds 5-with-remainder up.
+        assert_eq!(parse_decimal_i64_rounded("1.23455", 4, HalfDown), Ok(12345));
+        assert_eq!(
+            parse_decimal_i64_rounded("1.234551", 4, HalfDown),
+            Ok(12346)
+        );
+
+        // Trailing zeros never change the value or carry into rounding.
+        assert_eq!(parse_decimal_i64_rounded("1.23450000", 4, Up), Ok(12345));
+        assert_eq!(parse_decimal_i64_rounded("1.2345", 4, Up), Ok(12345));
+        // Any non-zero dropped digit rounds away from zero under `Up`.
+        assert_eq!(parse_decimal_i64_rounded("1.23451", 4, Up), Ok(12346));
+        assert_eq!(parse_decimal_i64_rounded("-1.23451", 4, Up), Ok(-12346));
+        assert_eq!(parse_decimal_i64_rounded("1.23459", 4, Down), Ok(12345));
+
+        // Rounding can carry into the integer part.
+        assert_eq!(parse_decimal_i64_rounded("0.99995", 4, HalfUp), Ok(10000));
+    }
+
+    #[test]
+    fn test_from_decimal_parts_overflow() {
+        // Scaled value exceeds the i64 backing.
+        assert_eq!(
+            Amount64::from_decimal_parts(i128::MAX, 0),
+            Err(AmountErrorKind::Overflow)
+        );
+        // Power of ten itself overflows i128.
+        assert_eq!(
+            Amount64::from_decimal_parts(1, 1000),
+            Err(AmountErrorKind::Overflow)
+        );
+        // Just past the backing range.
+        assert_eq!(
+            Amount64::from_decimal_parts(i64::MAX as i128 + 1, -4),
+            Err(AmountErrorKind::Overflow)
+        );
+    }
 
     #[test]
     fn test_add() {

@@ -20,6 +20,43 @@
 //! computations, in some cases like exchange rates higher precision is desirable.
 //! To address this, a sibling type 'Rate' is introduced with 8 fractional digits.
 //!
+//! ## Wider backings: 128-bit and 256-bit
+//!
+//! When the ~±922 trillion range of `Amount64` is not enough, the same decimal
+//! semantics are available on wider backing integers:
+//!
+//! * [`Amount128`] / [`Rate128`] ([`Decimal128`]): backed by `i128`, range about
+//!   ±1.7 * 10^34 at 4 digits.
+//! * [`Amount256`] / [`Rate256`] ([`Decimal256`]): backed by a 256-bit integer
+//!   ([`I256`]), range about ±5.8 * 10^72 at 4 digits.
+//!
+//! Addition and subtraction remain native integer operations (one or two
+//! add/adc instructions). Multiplication builds the double-width intermediate
+//! from 64-bit limbs and re-scales it by the compile-time constant 10^DIGITS
+//! using Möller–Granlund reciprocal multiplication with a compile-time
+//! reciprocal — no division instructions and no compiler builtins on that
+//! path, on any architecture (`scripts/check_asm.sh` verifies the generated
+//! code). Division by another decimal (a runtime divisor) uses a
+//! 128-bit-by-64-bit division primitive — the native `div` instruction on
+//! `x86_64` with the `asm` feature, or a portable long division on 32-bit
+//! half-digits — and Knuth's algorithm D over the significant limbs for
+//! divisors wider than one limb.
+//!
+//! Key operations (`checked_mul`, `mul_rounded`, `round_to`, `trunc`, `powi`,
+//! `from_str_rounded`, `from_str_const`, ...) are `const fn`, so rates, fees
+//! and whole derived constants can be evaluated at compile time:
+//!
+//! ```rust
+//! use fin_decimal::{Amount64, Rounding};
+//! const PRICE: Amount64 = Amount64::from_str_const("19.99");
+//! const RATE: Amount64 = Amount64::from_str_const("0.0825");
+//! const TAX: Amount64 = PRICE.mul_rounded(RATE, Rounding::HalfEven);
+//! ```
+//!
+//! The `*` and `/` operators of every backing panic on overflow regardless of
+//! build profile (they share one arithmetic core); use
+//! `checked_mul`/`checked_div` to get `None` instead.
+//!
 //! ## Usage
 //!
 //! The stable version of rust requires you to create a Decimal number
@@ -39,7 +76,6 @@
 //! let from_string = Amount64::from_str("2.02").unwrap(); // 2.0200
 //!
 //! // Using the `Into` trait
-#![warn(missing_docs)]
 //! let my_int : Amount64 = 3i32.into();
 //! ```
 //!
@@ -50,6 +86,7 @@
 #![crate_type = "lib"]
 #![no_std]
 #![deny(unconditional_recursion)]
+#![warn(missing_docs)]
 #![warn(clippy::all)]
 //#![feature(llvm_asm)]
 //#![feature(maybe_uninit_slice)]
@@ -66,14 +103,20 @@ use core::default::*;
 use core::f64;
 use core::fmt::*;
 use core::hash::Hash;
-use core::iter::{Product, Sum};
 use core::marker::*;
 use core::ops::*;
 use core::option::Option;
 use core::result::Result;
-use core::str::FromStr;
 
 use core::*;
+
+mod common;
+mod decimal128;
+mod decimal256;
+mod limbs;
+
+pub use decimal128::{Amount128, Decimal128, Rate128};
+pub use decimal256::{Amount256, Decimal256, I256, Rate256};
 
 /// Enum to store the various types of errors that can cause parsing an integer to fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,212 +162,19 @@ impl fmt::Display for AmountErrorKind {
     }
 }
 
-/// Divide 128 bit signed integer by 64 bit and return quotient and reminder
-#[cfg(all(target_arch = "x86_64", feature = "asm"))]
+/// Splits an i64 into a sign and a one-limb magnitude for the shared
+/// sign-magnitude cores in [`limbs`].
 #[inline]
-fn i128_by_i64_div_rem(duo: i128, div: i64) -> (i64, i64) {
-    let quo: i64;
-    let rem: i64;
-    let duo_lo = duo as i64;
-    let duo_hi = (duo >> 64) as i64;
-    unsafe {
-        core::arch::asm!(
-            "idiv {div}",
-            div = in(reg) div,
-            inout("rax") duo_lo => quo,
-            inout("rdx") duo_hi => rem,
-            options(nomem, nostack)
-        );
-    }
-    (quo, rem)
+const fn i64_sign_mag(v: i64) -> (bool, [u64; 1]) {
+    (v < 0, [v.unsigned_abs()])
 }
 
-/// Divide 128 bit signed integer by 64 bit and return quotient and reminder
-#[cfg(all(target_arch = "x86_64", feature = "asm"))]
+/// Rebuilds an i64 from a sign and a one-limb magnitude with the top bit
+/// clear (guaranteed by the shared cores' symmetric-range check).
 #[inline]
-#[allow(dead_code)]
-fn i128_by_i64_checked_div_rem(duo: i128, div: i64) -> Option<(i64, i64)> {
-    let quo: i64;
-    let rem: i64;
-    let duo_hi = (duo >> 64) as i64;
-    let duo_lo = duo as i64;
-    if duo_hi.abs() >= div.abs() {
-        // if higher word is larger, we will have overflow
-        None
-    } else {
-        unsafe {
-            core::arch::asm!(
-                "idiv {div}",
-                div = in(reg) div,
-                inout("rax") duo_lo => quo,
-                inout("rdx") duo_hi => rem,
-                options(nomem, nostack)
-            );
-        }
-        Some((quo, rem))
-    }
-}
-
-// for most other platforms which lacks native 128 bit by 64 bit division
-// TODO: replace to faster method for this case
-#[cfg(any(not(target_arch = "x86_64"), not(feature = "asm")))]
-#[inline]
-fn i128_by_i64_div_rem(duo: i128, div: i64) -> (i64, i64) {
-    (
-        (duo.wrapping_div(div as i128)) as i64,
-        (duo.wrapping_rem(div as i128)) as i64,
-    )
-}
-
-// for most other platforms which lacks native 128 bit by 64 bit division
-// TODO: replace to faster method for this case
-#[cfg(any(not(target_arch = "x86_64"), not(feature = "asm")))]
-#[inline]
-#[allow(dead_code)]
-fn i128_by_i64_checked_div_rem(duo: i128, div: i64) -> Option<(i64, i64)> {
-    if ((duo >> 64) as i64).abs() >= div.abs() {
-        None
-    } else {
-        Some((
-            (duo.wrapping_div(div as i128)) as i64,
-            (duo.wrapping_rem(div as i128)) as i64,
-        ))
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "asm"))]
-#[inline]
-fn i64_by_i64_div<const DIGITS: u8>(a: i64, b: i64) -> i64 {
-    let mut quo: i64;
-    let rem: i64;
-    let a_abs = a.abs();
-    let b_abs = b.abs();
-    let scale = Decimal::<DIGITS>::SCALE_INT;
-    unsafe {
-        core::arch::asm!(
-            "imul {scale}",
-            "idiv {b_abs}",
-            scale = in(reg) scale,
-            b_abs = in(reg) b_abs,
-            inout("rax") a_abs => quo,
-            out("rdx") rem,
-            options(nomem, nostack)
-        );
-    }
-    if rem * 2 > b_abs {
-        quo += 1;
-    }
-    if (a ^ b) < 0 {
-        quo = -quo
-    }
-    quo
-}
-
-#[cfg(any(not(target_arch = "x86_64"), not(feature = "asm")))]
-#[inline]
-fn i64_by_i64_div<const DIGITS: u8>(a: i64, b: i64) -> i64 {
-    // on X86 abs() is fast and cheap, no branches
-    let (mut rem, quo) = i128_by_i64_div_rem(
-        (a.abs() as i128) * (Decimal::<DIGITS>::SCALE_INT as i128),
-        b.abs(),
-    );
-    // if quotient larger than half of divisor, round up
-    // however, quotient has same sign as dividend, which results
-    if quo * 2 > b.abs() {
-        rem += 1;
-    }
-    if (a ^ b) < 0 {
-        rem = -rem
-    }
-
-    rem
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "asm"))]
-#[inline]
-fn i64_recip<const DIGITS: u8>(a: i64) -> i64 {
-    let mut quo: i64;
-    let rem: i64;
-    let a_abs = a.abs();
-    let num_lo = Decimal::<DIGITS>::SCALE_INT * Decimal::<DIGITS>::SCALE_INT;
-    unsafe {
-        core::arch::asm!(
-            "xor rdx, rdx",
-            "idiv {b_abs}",
-            b_abs = in(reg) a_abs,
-            inout("rax") num_lo => quo,
-            out("rdx") rem,
-            options(nomem, nostack)
-        );
-    }
-    if rem * 2 > a_abs {
-        quo += 1;
-    }
-    if a < 0 {
-        quo = -quo
-    }
-    quo
-}
-
-#[cfg(any(not(target_arch = "x86_64"), not(feature = "asm")))]
-#[inline]
-fn i64_recip<const DIGITS: u8>(a: i64) -> i64 {
-    let (mut rem, quo) = i128_by_i64_div_rem(
-        (Decimal::<DIGITS>::SCALE_INT * Decimal::<DIGITS>::SCALE_INT) as i128,
-        a.abs(),
-    );
-    if quo * 2 > a.abs() {
-        rem += 1;
-    }
-    if a < 0 {
-        rem = -rem
-    }
-    rem
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "asm"))]
-#[inline]
-fn i64_mul<const DIGITS: u8>(a: i64, b: i64) -> i64 {
-    let quo: i64;
-    let correction = if (a ^ b) < 0 {
-        -Decimal::<DIGITS>::SCALE_INT_HALF
-    } else {
-        Decimal::<DIGITS>::SCALE_INT_HALF
-    };
-    let corr_lo = correction as u64;
-    let corr_hi = (correction >> 63) as u64;
-    let div = Decimal::<DIGITS>::SCALE_INT;
-    unsafe {
-        core::arch::asm!(
-            "imul {b}",
-            "add rax, {corr_lo}",
-            "adc rdx, {corr_hi}",
-            "idiv {div}",
-            b = in(reg) b,
-            div = in(reg) div,
-            corr_lo = in(reg) corr_lo,
-            corr_hi = in(reg) corr_hi,
-            inout("rax") a => quo,
-            out("rdx") _,
-            options(nomem, nostack)
-        );
-    }
-    quo
-}
-
-#[cfg(any(not(target_arch = "x86_64"), not(feature = "asm")))]
-#[inline]
-fn i64_mul<const DIGITS: u8>(a: i64, b: i64) -> i64 {
-    let correction = if (a ^ b) < 0 {
-        -Decimal::<DIGITS>::SCALE_INT_HALF
-    } else {
-        Decimal::<DIGITS>::SCALE_INT_HALF
-    };
-    i128_by_i64_div_rem(
-        ((a as i128) * (b as i128)) + correction as i128,
-        Decimal::<DIGITS>::SCALE_INT,
-    )
-    .0
+const fn i64_from_sign_mag(neg: bool, mag: [u64; 1]) -> i64 {
+    let v = mag[0] as i64;
+    if neg { v.wrapping_neg() } else { v }
 }
 
 #[inline]
@@ -403,6 +253,9 @@ pub enum AmountSign {
 }
 
 /// Converts an i64 to a fixed-point string representation, optionally padded.
+///
+/// Thin wrapper over the shared limb formatter: same trailing-zero trimming
+/// and half-away-from-zero precision rounding, no `unsafe`.
 pub fn str_i64(
     num: i64,
     frac_digit: usize,
@@ -410,147 +263,14 @@ pub fn str_i64(
     sign: AmountSign,
     buf: &mut [u8],
 ) -> Option<&str> {
-    let scale = ipow10(frac_digit as i64) as u64;
-    let mut buf_ptr: *mut u8 = &mut buf[buf.len() - 1];
-    let last_ptr = buf_ptr;
-    let start_ptr: *mut u8 = &mut buf[0];
-
-    let mut num_abs = num.unsigned_abs();
-
-    if let Some(precision) = precision {
-        //if requested precision is larger than provided buffer return immediately
-        if precision >= buf.len() {
-            return None;
-        }
-        // if requested precision is less than number of digits, do rounding first
-        // we can't do it efficiently after splitting integer and fractional parts
-        if precision < frac_digit {
-            let round_scale = ipow10((frac_digit - precision) as i64) as u64;
-            let dropped = num_abs.wrapping_rem(round_scale);
-            if dropped.wrapping_shl(1) >= round_scale {
-                num_abs += round_scale;
-            }
-            num_abs -= dropped;
-        }
-    }
-
-    let mut frac_part = num_abs.wrapping_rem(scale);
-    let mut int_part = num_abs.wrapping_div(scale);
-
-    if frac_part > 0 || precision.is_some() {
-        let mut rem;
-        let mut digits = 0;
-
-        // skip trailing zeros for fraction, digits counts trailing zeros
-        if frac_part == 0 {
-            // for zero fractional part with have frac_digit zeros
-            digits = frac_digit;
-            rem = 0;
-        } else {
-            loop {
-                rem = frac_part % 10;
-                frac_part /= 10;
-                if rem != 0 {
-                    break;
-                }
-                digits += 1;
-            }
-        }
-        // if precision is higher than fractional part, pad right with zeros
-        if let Some(mut precision) = precision {
-            while precision > frac_digit - digits {
-                // SAFETY: already checked that precision is less than length
-                unsafe {
-                    *buf_ptr = b'0';
-                    buf_ptr = buf_ptr.sub(1);
-                    precision -= 1;
-                };
-            }
-        }
-
-        unsafe {
-            if digits != frac_digit {
-                if buf_ptr < start_ptr {
-                    return None;
-                }
-                *buf_ptr = (rem as u8) + b'0';
-                buf_ptr = buf_ptr.sub(1);
-                digits += 1;
-            }
-            while frac_part != 0 {
-                rem = frac_part % 10;
-                frac_part /= 10;
-                digits += 1;
-                if buf_ptr < start_ptr {
-                    return None;
-                }
-                *buf_ptr = (rem as u8) + b'0';
-                buf_ptr = buf_ptr.sub(1);
-            }
-            // Add zeros right of decimal point
-            while digits < frac_digit {
-                if buf_ptr < start_ptr {
-                    return None;
-                }
-                *buf_ptr = b'0';
-                buf_ptr = buf_ptr.sub(1);
-                digits += 1;
-            }
-            // At last add decimal point
-            if buf_ptr < start_ptr {
-                return None;
-            }
-            *buf_ptr = b'.';
-            buf_ptr = buf_ptr.sub(1);
-        }
-    }
-
-    // process integer part
-    let mut rem;
-    // SAFETY: `curr` > 0 (since we made `buf` large enough)
-    unsafe {
-        loop {
-            rem = int_part % 10;
-            int_part /= 10;
-            if buf_ptr < start_ptr {
-                return None;
-            }
-            *buf_ptr = (rem as u8) + b'0';
-            buf_ptr = buf_ptr.sub(1);
-            if int_part == 0 {
-                break;
-            }
-        }
-    }
-    let sign_sym: u8 = match num < 0 {
-        true => b'-',
-        _ => b'+',
-    };
-
-    match (sign, num < 0, num > 0) {
-        (AmountSign::None, _, _) => {}
-        (AmountSign::Always, _, true) | (_, true, _) => {
-            if buf_ptr < start_ptr {
-                return None;
-            }
-            unsafe {
-                *buf_ptr = sign_sym;
-                buf_ptr = buf_ptr.sub(1);
-            }
-        }
-        _ => {}
-    }
-
-    // SAFETY: `curr` > 0 (since we made `buf` large enough), and all the chars are valid
-    // UTF-8 since `DEC_DIGITS_LUT` is
-    let buf_slice = unsafe {
-        str::from_utf8_unchecked(slice::from_raw_parts(
-            buf_ptr.add(1),                         // buf_ptr.offset(curr),
-            last_ptr.offset_from(buf_ptr) as usize, //buf.len() - curr as usize,
-        ))
-    };
-
-    Some(buf_slice)
+    limbs::str_mag(
+        &[num.unsigned_abs()],
+        num < 0,
+        frac_digit,
+        precision,
+        sign,
+        buf,
+    )
 }
 
 #[test]
@@ -649,16 +369,6 @@ fn test_istr() {
     );
 }
 
-fn fmt_i64(num: i64, frac_digit: usize, f: &mut fmt::Formatter) -> fmt::Result {
-    // integer part is 16 digits + decimal point + 4 fractional and sign
-    let mut buf = [0u8; 3 * mem::size_of::<i64>()];
-
-    match str_i64(num, frac_digit, f.precision(), AmountSign::None, &mut buf) {
-        Some(s) => f.pad_integral(num > 0, "", s), // final padding and sign
-        _ => f.write_str("Amount::ERROR"),
-    }
-}
-
 /// Converts a string in base 10 to a fixed-point scaled value.
 /// Can be used with non-default scale to handle higher precision
 /// exchange rates and other scenarios with longer fractional parts.
@@ -677,121 +387,21 @@ pub fn parse_decimal_i64(src: &str, scale: u8) -> Result<i64, AmountErrorKind> {
 /// "correct" in the IEEE sense: it inspects the first dropped digit together with
 /// a sticky flag (whether any further digit is non-zero) and, for `HalfEven`, the
 /// parity of the retained value.
-pub fn parse_decimal_i64_rounded(
+pub const fn parse_decimal_i64_rounded(
     src: &str,
     scale: u8,
     mode: Rounding,
 ) -> Result<i64, AmountErrorKind> {
-    // all valid digits are ascii, so we will just iterate over the utf8 bytes
-    // and cast them to chars.
-    let src: &[u8] = src.as_bytes();
-    // temporarily result
-    let scale = scale as i64;
-    let mut result: i64 = 0; // intermediate result
-    let mut intpart: i64 = 0; // integer part if decimal point present
-    let mut point: i64 = 0; // flag and counter for decimal point digits
-    let mut digit = false; // true if there was any digit
-    let mut round_digit: i64 = 0; // first fractional digit dropped beyond `scale`
-    let mut sticky = false; // any non-zero digit beyond `round_digit`
-    let int_scale: i64 = ipow10(scale);
-
-    if src.is_empty() {
-        return Err(AmountErrorKind::Empty);
-    }
-
-    // ok, check if we have a sign and move forward if so
-    let (sign, digits) = match src[0] {
-        b'+' => (false, &src[1..]),
-        b'-' => (true, &src[1..]),
-        _ => (false, src),
+    // Delegates to the shared limb parser at one-limb width; only the
+    // symmetric i64 range check lives here.
+    let (neg, mag) = match limbs::parse_decimal_mag_rounded::<1>(src, scale, mode) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
     };
-
-    for s in digits {
-        match s {
-            b'.' if point > 0 => {
-                // should be just one decimal point
-                return Err(AmountErrorKind::InvalidDigit);
-            }
-            b'.' => {
-                // move scaled result to integer part
-                intpart = match result.checked_mul(int_scale) {
-                    Some(result) => result,
-                    None => return Err(AmountErrorKind::Overflow),
-                };
-                point = 1;
-                // now result accumulates fractional part
-                result = 0
-            }
-            c @ b'0'..=b'9' => {
-                digit = true; // mark that we got at list one digit
-                let x: i64 = (c - b'0') as i64; // convert digit to number
-
-                // if not decimal point or within resolution of type
-                // compute intermediate result
-                if point <= scale {
-                    result = match result.checked_mul(10) {
-                        Some(result) => result,
-                        None => return Err(AmountErrorKind::Overflow),
-                    };
-                    result = match result.checked_add(x) {
-                        Some(result) => result,
-                        None => return Err(AmountErrorKind::Overflow),
-                    }
-                } else if point == (scale + 1) {
-                    // first digit beyond the resolution of the type
-                    round_digit = x;
-                } else if x != 0 {
-                    // any further non-zero digit sets the sticky flag
-                    sticky = true;
-                }
-                if point > 0 {
-                    point += 1 // count numbers after decimal point
-                }
-            }
-            _ => return Err(AmountErrorKind::InvalidDigit),
-        }
+    if mag[0] > i64::MAX as u64 {
+        return Err(AmountErrorKind::Overflow);
     }
-    // there was no number, so return error
-    if !digit {
-        return Err(AmountErrorKind::Empty);
-    }
-
-    if point == 0 {
-        point = 1 // no decimal point is same as just decimal point
-    };
-    // scale result to required precision (append zero's to fraction)
-    result = match result.checked_mul(ipow10(scale + 1 - point)) {
-        Some(result) => result,
-        None => return Err(AmountErrorKind::Overflow),
-    };
-
-    // apply the rounding mode to the dropped fractional digits. `result` here is
-    // the magnitude (sign is applied last); a carry into the integer part is
-    // absorbed naturally since `result == int_scale` represents exactly 1.0.
-    let round_up = match mode {
-        Rounding::HalfUp => round_digit >= 5,
-        Rounding::HalfDown => round_digit > 5 || (round_digit == 5 && sticky),
-        Rounding::HalfEven => round_digit > 5 || (round_digit == 5 && (sticky || result % 2 != 0)),
-        Rounding::Down => false,
-        Rounding::Up => round_digit != 0 || sticky,
-    };
-    if round_up {
-        result = match result.checked_add(1) {
-            Some(result) => result,
-            None => return Err(AmountErrorKind::Overflow),
-        };
-    }
-
-    // combine integer and fractional parts
-    result = match result.checked_add(intpart) {
-        Some(result) => result,
-        None => return Err(AmountErrorKind::Overflow),
-    };
-    // negate final result if signed number
-    if sign {
-        result = -result
-    }
-    Ok(result)
+    Ok(i64_from_sign_mag(neg, mag))
 }
 
 /// `Rounding` represents the different strategies that can be used.
@@ -1140,10 +750,29 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     ///     Ok(Amount64::from(12346) / Amount64::from(10000)),
     /// );
     /// ```
-    pub fn from_str_rounded(src: &str, mode: Rounding) -> Result<Self, AmountErrorKind> {
-        Ok(Decimal::<DIGITS>(parse_decimal_i64_rounded(
-            src, DIGITS, mode,
-        )?))
+    pub const fn from_str_rounded(src: &str, mode: Rounding) -> Result<Self, AmountErrorKind> {
+        match parse_decimal_i64_rounded(src, DIGITS, mode) {
+            Ok(v) => Ok(Decimal::<DIGITS>(v)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Parses a decimal string with [`Rounding::HalfUp`], panicking on invalid
+    /// input — intended for compile-time constants, where the panic becomes a
+    /// compile error.
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::Amount64;
+    /// use core::str::FromStr;
+    /// const PRICE: Amount64 = Amount64::from_str_const("19.99");
+    /// assert_eq!(Ok(PRICE), Amount64::from_str("19.99"));
+    /// ```
+    pub const fn from_str_const(src: &str) -> Self {
+        match Self::from_str_rounded(src, Rounding::HalfUp) {
+            Ok(v) => v,
+            Err(_) => panic!("invalid decimal literal"),
+        }
     }
 
     /// Computes the absolute value of self.
@@ -1180,50 +809,37 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         }
     }
 
+    /// Sign and 4-limb magnitude (zero-extended), for the shared
+    /// formatting code in [`common`](crate::common).
+    #[inline]
+    pub(crate) const fn sign_mag4(self) -> (bool, [u64; 4]) {
+        (self.0 < 0, [self.0.unsigned_abs(), 0, 0, 0])
+    }
+
     /// Checked integer multiplication. Computes `self * rhs`, returning `None` if overflow occurred.
     #[inline]
-    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
-        let correction = if (self.0 ^ rhs.0) < 0 {
-            -Decimal::<DIGITS>::SCALE_INT_HALF
-        } else {
-            Decimal::<DIGITS>::SCALE_INT_HALF
-        };
-
-        let duo = (self.0 as i128) * (rhs.0 as i128) + (correction as i128);
-        if let Some((quo, _)) = i128_by_i64_checked_div_rem(duo, Decimal::<DIGITS>::SCALE_INT) {
-            Some(Decimal::<DIGITS>(quo))
-        } else {
-            None
+    pub const fn checked_mul(self, rhs: Self) -> Option<Self> {
+        let (an, am) = i64_sign_mag(self.0);
+        let (bn, bm) = i64_sign_mag(rhs.0);
+        match limbs::dec_mul::<DIGITS, 1, 2>(an, &am, bn, &bm, Rounding::HalfUp) {
+            Some((neg, mag)) => Some(Decimal::<DIGITS>(i64_from_sign_mag(neg, mag))),
+            None => None,
         }
     }
 
     /// Checked integer division. Computes `self / rhs`, returning `None` if `rhs == 0` or the division results in overflow.
     #[inline]
     pub fn checked_div(self, rhs: Self) -> Option<Self> {
-        if rhs.0 == 0 {
-            return None;
-        }
-        let duo = (self.0.abs() as i128) * (Decimal::<DIGITS>::SCALE_INT as i128);
-        if let Some((quo, mut rem)) = i128_by_i64_checked_div_rem(duo, rhs.0.abs()) {
-            if quo * 2 > rhs.0.abs() {
-                rem += 1;
-            }
-            if (self.0 ^ rhs.0) < 0 {
-                rem = -rem;
-            }
-            Some(Decimal::<DIGITS>(rem))
-        } else {
-            None
-        }
+        let (an, am) = i64_sign_mag(self.0);
+        let (bn, bm) = i64_sign_mag(rhs.0);
+        limbs::dec_div::<DIGITS, 1, 2>(an, &am, bn, &bm, Rounding::HalfUp)
+            .map(|(neg, mag)| Decimal::<DIGITS>(i64_from_sign_mag(neg, mag)))
     }
 
     /// Takes the reciprocal (inverse) of a number, 1/x.
     #[inline]
     pub fn recip(self) -> Self {
-        if self.0 == 0 {
-            panic!("Can't divide by zero");
-        }
-        Decimal::<DIGITS>(i64_recip::<DIGITS>(self.0))
+        Self::ONE.div_rounded(self, Rounding::HalfUp)
     }
 
     /// Returns the integer part of a number.
@@ -1343,7 +959,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     }
 
     /// Explicitly rounds the value using the specified rounding mode.
-    pub fn round_to(self, mode: Rounding) -> Self {
+    pub const fn round_to(self, mode: Rounding) -> Self {
         let frac = self.0 % Decimal::<DIGITS>::SCALE_INT;
         if frac == 0 {
             return self;
@@ -1410,138 +1026,35 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     }
 
     /// Multiply by another decimal, explicitly applying the given rounding mode.
-    pub fn mul_rounded(self, rhs: Self, mode: Rounding) -> Self {
-        let duo = (self.0 as i128) * (rhs.0 as i128);
-        let (mut quo, rem) = i128_by_i64_div_rem(duo, Decimal::<DIGITS>::SCALE_INT);
-
-        if rem == 0 {
-            return Decimal::<DIGITS>(quo);
+    ///
+    /// Usable in const contexts, so multiplication chains can be evaluated at
+    /// compile time.
+    ///
+    /// # Panics
+    /// Panics if the result overflows.
+    pub const fn mul_rounded(self, rhs: Self, mode: Rounding) -> Self {
+        let (an, am) = i64_sign_mag(self.0);
+        let (bn, bm) = i64_sign_mag(rhs.0);
+        match limbs::dec_mul::<DIGITS, 1, 2>(an, &am, bn, &bm, mode) {
+            Some((neg, mag)) => Decimal::<DIGITS>(i64_from_sign_mag(neg, mag)),
+            None => panic!("attempt to multiply with overflow"),
         }
-
-        let mut add_one = false;
-        let mut sub_one = false;
-        let half = Decimal::<DIGITS>::SCALE_INT_HALF;
-
-        match mode {
-            Rounding::HalfEven => {
-                let is_even = quo % 2 == 0;
-                if rem > half {
-                    add_one = true;
-                } else if rem < -half {
-                    sub_one = true;
-                } else if rem == half {
-                    if !is_even {
-                        add_one = true;
-                    }
-                } else if rem == -half && !is_even {
-                    sub_one = true;
-                }
-            }
-            Rounding::HalfUp => {
-                if rem >= half {
-                    add_one = true;
-                } else if rem <= -half {
-                    sub_one = true;
-                }
-            }
-            Rounding::HalfDown => {
-                if rem > half {
-                    add_one = true;
-                } else if rem < -half {
-                    sub_one = true;
-                }
-            }
-            Rounding::Down => {
-                if rem < 0 {
-                    sub_one = true;
-                }
-            }
-            Rounding::Up => {
-                if rem > 0 {
-                    add_one = true;
-                }
-            }
-        }
-
-        if add_one {
-            quo += 1;
-        }
-        if sub_one {
-            quo -= 1;
-        }
-        Decimal::<DIGITS>(quo)
     }
 
     /// Divide by another decimal, explicitly applying the given rounding mode.
+    ///
+    /// # Panics
+    /// Panics if `rhs` is zero or the result overflows.
     pub fn div_rounded(self, rhs: Self, mode: Rounding) -> Self {
         if rhs.0 == 0 {
             panic!("Can't divide by zero");
         }
-        let duo = (self.0.abs() as i128) * (Decimal::<DIGITS>::SCALE_INT as i128);
-        let (mut quo, rem) = i128_by_i64_div_rem(duo, rhs.0.abs());
-
-        if (self.0 ^ rhs.0) < 0 {
-            quo = -quo;
+        let (an, am) = i64_sign_mag(self.0);
+        let (bn, bm) = i64_sign_mag(rhs.0);
+        match limbs::dec_div::<DIGITS, 1, 2>(an, &am, bn, &bm, mode) {
+            Some((neg, mag)) => Decimal::<DIGITS>(i64_from_sign_mag(neg, mag)),
+            None => panic!("attempt to divide with overflow"),
         }
-
-        if rem == 0 {
-            return Decimal::<DIGITS>(quo);
-        }
-
-        let mut add_one = false;
-        let mut sub_one = false;
-        let is_neg = (self.0 ^ rhs.0) < 0;
-        let half = rhs.0.abs() / 2;
-        let is_even_div = rhs.0.abs() % 2 == 0;
-
-        match mode {
-            Rounding::HalfEven => {
-                let is_even = quo % 2 == 0;
-                if rem > half || (rem == half && (!is_even_div || !is_even)) {
-                    if is_neg {
-                        sub_one = true;
-                    } else {
-                        add_one = true;
-                    }
-                }
-            }
-            Rounding::HalfUp => {
-                if rem > half || (rem == half && is_even_div) {
-                    if is_neg {
-                        sub_one = true;
-                    } else {
-                        add_one = true;
-                    }
-                }
-            }
-            Rounding::HalfDown => {
-                if rem > half {
-                    if is_neg {
-                        sub_one = true;
-                    } else {
-                        add_one = true;
-                    }
-                }
-            }
-            Rounding::Down => {
-                if is_neg {
-                    sub_one = true;
-                }
-            }
-            Rounding::Up => {
-                if !is_neg {
-                    add_one = true;
-                }
-            }
-        }
-
-        if add_one {
-            quo += 1;
-        }
-        if sub_one {
-            quo -= 1;
-        }
-        Decimal::<DIGITS>(quo)
     }
 
     #[inline]
@@ -1777,23 +1290,23 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     ///
     /// assert!(abs_difference < 1e-10);
     /// ```
-    pub fn powi(self, mut exp: u32) -> Self {
+    pub const fn powi(self, mut exp: u32) -> Self {
         let mut base = self;
         let mut acc = Self::ONE;
 
         while exp > 1 {
             if (exp & 1) == 1 {
-                acc = base * acc;
+                acc = base.mul_rounded(acc, Rounding::HalfUp);
             }
             exp /= 2;
-            base = base * base;
+            base = base.mul_rounded(base, Rounding::HalfUp);
         }
 
         // Deal with the final bit of the exponent separately, since
         // squaring the base afterwards is not necessary and may cause a
         // needless overflow.
         if exp == 1 {
-            acc = base * acc;
+            acc = base.mul_rounded(acc, Rounding::HalfUp);
         }
 
         acc
@@ -1838,45 +1351,6 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     #[inline]
     pub fn max(self, other: Self) -> Self {
         if self >= other { self } else { other }
-    }
-}
-
-impl<const DIGITS: u8> FromStr for Decimal<DIGITS> {
-    type Err = AmountErrorKind;
-    /// Converts a string in base 10 to a fixed-point Amount64.
-    /// Use default number of decimal digits
-    ///
-    /// This function accepts strings such as
-    ///
-    /// * '3.14'
-    /// * '-3.14'
-    /// * '5.'
-    /// * '.5', or, equivalently, '0.5'
-    ///
-    /// Leading and trailing whitespace and other symbols represent an error.
-    ///
-    /// # Grammar
-    ///
-    /// All strings that adhere to the following grammar will result in
-    /// an [`Ok`] being returned:
-    ///
-    /// ```txt
-    /// Float  ::= Sign?  Number
-    /// Number ::= ( Digit+ |
-    ///              Digit+ '.' Digit* |
-    ///              Digit* '.' Digit+ )
-    /// Sign   ::= [+-]
-    /// Digit  ::= [0-9]
-    /// ```
-    fn from_str(src: &str) -> Result<Self, Self::Err> {
-        let result = parse_decimal_i64(src, DIGITS)?;
-        Ok(Decimal::<DIGITS>(result))
-    }
-}
-
-impl<const DIGITS: u8> From<&str> for Decimal<DIGITS> {
-    fn from(src: &str) -> Self {
-        Decimal::<DIGITS>(parse_decimal_i64(src, DIGITS).unwrap())
     }
 }
 
@@ -1979,13 +1453,6 @@ impl<const DIGITS: u8> Add for Decimal<DIGITS> {
     }
 }
 
-impl<const DIGITS: u8> AddAssign for Decimal<DIGITS> {
-    #[inline]
-    fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
-    }
-}
-
 impl<const DIGITS: u8> Add<i64> for Decimal<DIGITS> {
     type Output = Self;
     #[inline]
@@ -2042,13 +1509,6 @@ impl<const DIGITS: u8> Sub for Decimal<DIGITS> {
     }
 }
 
-impl<const DIGITS: u8> SubAssign for Decimal<DIGITS> {
-    #[inline]
-    fn sub_assign(&mut self, rhs: Self) {
-        self.0 -= rhs.0;
-    }
-}
-
 impl<const DIGITS: u8> Sub<i64> for Decimal<DIGITS> {
     type Output = Self;
     #[inline]
@@ -2102,14 +1562,7 @@ impl<const DIGITS: u8> Mul for Decimal<DIGITS> {
 
     #[inline]
     fn mul(self, rhs: Decimal<DIGITS>) -> Self::Output {
-        Decimal::<DIGITS>(i64_mul::<DIGITS>(self.0, rhs.0))
-    }
-}
-
-impl<const DIGITS: u8> MulAssign for Decimal<DIGITS> {
-    #[inline]
-    fn mul_assign(&mut self, rhs: Self) {
-        self.0 = i64_mul::<DIGITS>(self.0, rhs.0);
+        self.mul_rounded(rhs, Rounding::HalfUp)
     }
 }
 
@@ -2135,7 +1588,7 @@ impl<const DIGITS: u8> Mul<Decimal<DIGITS>> for i64 {
 
     #[inline]
     fn mul(self, rhs: Decimal<DIGITS>) -> i64 {
-        i64_mul::<DIGITS>(self, rhs.0)
+        (Decimal::<DIGITS>(self) * rhs).0
     }
 }
 
@@ -2144,14 +1597,7 @@ impl<const DIGITS: u8> Div for Decimal<DIGITS> {
 
     #[inline]
     fn div(self, rhs: Self) -> Self {
-        Decimal::<DIGITS>(i64_by_i64_div::<DIGITS>(self.0, rhs.0))
-    }
-}
-
-impl<const DIGITS: u8> DivAssign for Decimal<DIGITS> {
-    #[inline]
-    fn div_assign(&mut self, rhs: Self) {
-        self.0 = i64_by_i64_div::<DIGITS>(self.0, rhs.0);
+        self.div_rounded(rhs, Rounding::HalfUp)
     }
 }
 
@@ -2164,109 +1610,7 @@ impl<const DIGITS: u8> Rem for Decimal<DIGITS> {
     }
 }
 
-impl<const DIGITS: u8> RemAssign for Decimal<DIGITS> {
-    #[inline]
-    fn rem_assign(&mut self, rhs: Self) {
-        self.0 %= rhs.0;
-    }
-}
-
-impl<const DIGITS: u8> Sum for Decimal<DIGITS> {
-    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        iter.fold(Self::ZERO, |a, b| a + b)
-    }
-}
-
-impl<'a, const DIGITS: u8> Sum<&'a Decimal<DIGITS>> for Decimal<DIGITS> {
-    fn sum<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
-        iter.fold(Self::ZERO, |a, b| a + *b)
-    }
-}
-
-impl<const DIGITS: u8> Product for Decimal<DIGITS> {
-    fn product<I: Iterator<Item = Self>>(iter: I) -> Self {
-        iter.fold(Self::ONE, |a, b| a * b)
-    }
-}
-
-impl<'a, const DIGITS: u8> Product<&'a Decimal<DIGITS>> for Decimal<DIGITS> {
-    fn product<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
-        iter.fold(Self::ONE, |a, b| a * *b)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<const DIGITS: u8> serde::Serialize for Decimal<DIGITS> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.collect_str(self)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de, const DIGITS: u8> serde::Deserialize<'de> for Decimal<DIGITS> {
-    fn deserialize<Deser>(deserializer: Deser) -> Result<Self, Deser::Error>
-    where
-        Deser: serde::Deserializer<'de>,
-    {
-        struct DecimalVisitor<const D: u8>;
-
-        impl<'de, const D: u8> serde::de::Visitor<'de> for DecimalVisitor<D> {
-            type Value = Decimal<D>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a string representation of a decimal number")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                FromStr::from_str(value).map_err(serde::de::Error::custom)
-            }
-        }
-
-        deserializer.deserialize_str(DecimalVisitor::<DIGITS>)
-    }
-}
-
-impl<const DIGITS: u8> fmt::Display for Decimal<DIGITS> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt_i64(self.0, DIGITS as usize, f)
-    }
-}
-
-#[cfg(feature = "ufmt")]
-impl<const DIGITS: u8> ufmt::uDisplay for Decimal<DIGITS> {
-    fn fmt<W>(&self, f: &mut ufmt::Formatter<'_, W>) -> Result<(), W::Error>
-    where
-        W: ufmt::uWrite + ?Sized,
-    {
-        let mut buf = [0u8; 3 * core::mem::size_of::<i64>()];
-        match str_i64(
-            self.0,
-            DIGITS as usize,
-            None,
-            AmountSign::Negative,
-            &mut buf,
-        ) {
-            Some(s) => f.write_str(s),
-            None => f.write_str("Amount::ERROR"),
-        }
-    }
-}
-
-#[cfg(feature = "ufmt")]
-impl<const DIGITS: u8> ufmt::uDebug for Decimal<DIGITS> {
-    fn fmt<W>(&self, f: &mut ufmt::Formatter<'_, W>) -> Result<(), W::Error>
-    where
-        W: ufmt::uWrite + ?Sized,
-    {
-        f.debug_tuple("Decimal")?.field(&self.0)?.finish()
-    }
-}
+crate::common::impl_decimal_common!(Decimal, "Decimal");
 
 #[cfg(test)]
 mod tests {
@@ -2791,6 +2135,10 @@ mod tests {
         assert_eq!(&format!("{:+}", Decimal::<4>(-10000)), "-1");
         assert_eq!(&format!("{}", Decimal::<4>(10001)), "1.0001");
         assert_eq!(&format!("{}", Decimal::<4>(-10001)), "-1.0001");
+        // Regression: zero used to render as "-0" (pad_integral was handed
+        // `num > 0` as the non-negative flag).
+        assert_eq!(&format!("{}", Decimal::<4>(0)), "0");
+        assert_eq!(&format!("{:+}", Decimal::<4>(0)), "+0"); // matches i32 behavior
     }
 
     #[test]
@@ -2821,6 +2169,78 @@ mod tests {
             Some(Amount64::from(1))
         );
         assert_eq!(Amount64::from(2).checked_div(Amount64::from(0)), None);
+        // Regression: checked_div used to return the remainder, not the quotient.
+        assert_eq!(
+            Amount64::from(6).checked_div(Amount64::from(2)),
+            Some(Amount64::from(3))
+        );
+        assert_eq!(
+            Amount64::from(1).checked_div(Amount64::from(3)),
+            Some(Decimal::<4>(3333))
+        );
+        assert_eq!(
+            Amount64::from(-1).checked_div(Amount64::from(3)),
+            Some(Decimal::<4>(-3333))
+        );
+        assert_eq!(max.checked_mul(Amount64::from(2)), None);
+    }
+
+    #[test]
+    fn test_const_eval() {
+        use crate::Rounding;
+        // Whole expressions evaluate at compile time.
+        const PRICE: Amount64 = Amount64::from_str_const("19.99");
+        const RATE: Amount64 = Amount64::from_str_const("0.0825");
+        const TAX: Amount64 = PRICE.mul_rounded(RATE, Rounding::HalfEven);
+        const DOUBLED: Option<Amount64> = PRICE.checked_mul(Amount64::from_str_const("2"));
+        const GROWTH: Amount64 = Amount64::from_str_const("1.05").powi(10);
+        const ROUNDED: Amount64 = TAX.round_to(Rounding::HalfUp);
+
+        assert_eq!(PRICE.0, 199_900);
+        // Compile-time results match the runtime paths exactly.
+        let price = Amount64::from_str("19.99").unwrap();
+        let rate = Amount64::from_str("0.0825").unwrap();
+        assert_eq!(TAX, price.mul_rounded(rate, Rounding::HalfEven));
+        assert_eq!(DOUBLED, price.checked_mul(Amount64::from(2)));
+        assert_eq!(GROWTH, Amount64::from_str("1.05").unwrap().powi(10));
+        assert_eq!(ROUNDED, TAX.round_to(Rounding::HalfUp));
+        assert_eq!(
+            Amount64::from_str_rounded("1.00005", Rounding::HalfEven),
+            Ok(Decimal::<4>(10000))
+        );
+    }
+
+    #[test]
+    fn test_div_half_ties() {
+        // Exact half ties round away from zero under the default HalfUp:
+        // 0.0001 / 2 = 0.00005 -> 0.0001.
+        assert_eq!(Decimal::<4>(1) / Decimal::<4>(20000), Decimal::<4>(1));
+        assert_eq!(Decimal::<4>(-1) / Decimal::<4>(20000), Decimal::<4>(-1));
+        assert_eq!(
+            Decimal::<4>(1).checked_div(Decimal::<4>(20000)),
+            Some(Decimal::<4>(1))
+        );
+        // recip: 1 / 20000.0 = 0.00005 -> 0.0001.
+        assert_eq!(Decimal::<4>(200000000).recip(), Decimal::<4>(1));
+
+        // HalfEven with an odd divisor: rem == (d-1)/2 is *below* the half,
+        // so 0.0001 / 0.0003 = 0.3333... stays 0.3333.
+        use crate::Rounding;
+        assert_eq!(
+            Decimal::<4>(1).div_rounded(Decimal::<4>(3), Rounding::HalfEven),
+            Decimal::<4>(3333)
+        );
+        // Even divisor exact tie obeys the parity of the quotient.
+        // 0.3333 / 2 = 0.16665: quotient 1666 is even -> stays.
+        assert_eq!(
+            Decimal::<4>(3333).div_rounded(Decimal::<4>(20000), Rounding::HalfEven),
+            Decimal::<4>(1666)
+        );
+        // 0.3335 / 2 = 0.16675: quotient 1667 is odd -> rounds to 1668.
+        assert_eq!(
+            Decimal::<4>(3335).div_rounded(Decimal::<4>(20000), Rounding::HalfEven),
+            Decimal::<4>(1668)
+        );
     }
 
     #[cfg(feature = "ufmt")]

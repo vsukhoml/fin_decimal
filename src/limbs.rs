@@ -774,6 +774,20 @@ pub(crate) const fn parse_decimal_mag_rounded<const W: usize>(
     Ok((sign, acc))
 }
 
+/// ASCII digit pairs `"00"`..`"99"` (most significant digit first), so digit
+/// extraction below can take two digits per strength-reduced division by 100,
+/// halving the serial divide chain that dominates formatting latency.
+const DIGIT_PAIRS: [u8; 200] = {
+    let mut t = [0u8; 200];
+    let mut i = 0;
+    while i < 100 {
+        t[2 * i] = b'0' + (i / 10) as u8;
+        t[2 * i + 1] = b'0' + (i % 10) as u8;
+        i += 1;
+    }
+    t
+};
+
 /// Formats a scaled decimal magnitude into `buf`, mirroring the semantics of
 /// [`str_i64`](crate::str_i64): trailing fractional zeros are trimmed when no
 /// precision is given, an explicit precision rounds (half away from zero) or
@@ -808,25 +822,108 @@ pub(crate) fn str_mag<'a>(
         }
     }
 
-    // Extract decimal digits, least significant first, in 19-digit chunks so
-    // each step is a single division by a word.
-    let mut digits = [0u8; 96];
-    let mut nd = 0usize;
-    loop {
-        let mut rem = div_words_by_pow10::<19>(&mut work);
-        if is_zero(&work) {
-            while rem != 0 {
-                digits[nd] = (rem % 10) as u8;
-                rem /= 10;
-                nd += 1;
+    // Fast path: a single-limb magnitude with default precision — every
+    // i64-backed value and typical wide-type magnitudes. Digits go straight
+    // into `buf` right-to-left, so there is no intermediate digit buffer and
+    // no second pass. At most 21 digits, the point and a sign are written
+    // (23 bytes), so with `buf.len() >= 24` the positions never underflow.
+    if precision.is_none() && buf.len() >= 24 && sig_limbs(&work) == 1 {
+        let mut pos = buf.len();
+        let mut v = work[0];
+        let is_zero_val = v == 0;
+        // Trim trailing fractional zeros, then emit the remaining fraction.
+        let mut fd = frac_digits;
+        while fd > 0 && v % 10 == 0 {
+            v /= 10;
+            fd -= 1;
+        }
+        if fd > 0 {
+            while fd >= 2 {
+                let p = (v % 100) as usize * 2;
+                v /= 100;
+                pos -= 2;
+                buf[pos] = DIGIT_PAIRS[p];
+                buf[pos + 1] = DIGIT_PAIRS[p + 1];
+                fd -= 2;
             }
-            break;
+            if fd > 0 {
+                pos -= 1;
+                buf[pos] = (v % 10) as u8 + b'0';
+                v /= 10;
+            }
+            pos -= 1;
+            buf[pos] = b'.';
         }
-        for _ in 0..19 {
-            digits[nd] = (rem % 10) as u8;
-            rem /= 10;
-            nd += 1;
+        // Integer part, at least one digit (possibly zero).
+        while v >= 100 {
+            let p = (v % 100) as usize * 2;
+            v /= 100;
+            pos -= 2;
+            buf[pos] = DIGIT_PAIRS[p];
+            buf[pos + 1] = DIGIT_PAIRS[p + 1];
         }
+        if v >= 10 {
+            let p = v as usize * 2;
+            pos -= 2;
+            buf[pos] = DIGIT_PAIRS[p];
+            buf[pos + 1] = DIGIT_PAIRS[p + 1];
+        } else {
+            pos -= 1;
+            buf[pos] = v as u8 + b'0';
+        }
+        match (sign, neg && !is_zero_val) {
+            (AmountSign::None, _) => {}
+            (_, true) => {
+                pos -= 1;
+                buf[pos] = b'-';
+            }
+            (AmountSign::Always, false) if !is_zero_val => {
+                pos -= 1;
+                buf[pos] = b'+';
+            }
+            _ => {}
+        }
+        // All bytes written are ASCII digits, '.', '+' or '-'.
+        return core::str::from_utf8(&buf[pos..]).ok();
+    }
+
+    // Extract ASCII digits, least significant first. While the value spans
+    // several limbs, full 19-digit chunks come off with one reciprocal
+    // division by 10^19 per pass; the last limb's digits come straight off
+    // that word. The value is < 10^78 (and each chunk emits real positional
+    // digits), so `nd` stays well within the 96-digit buffer.
+    let mut digits = [b'0'; 96];
+    let mut nd = 0usize;
+    while sig_limbs(&work) > 1 {
+        let mut rem = div_words_by_pow10::<19>(&mut work);
+        // Exactly 19 digits: nine pairs, then the leftover top digit
+        // (rem < 10^19 / 100^9 = 10).
+        for _ in 0..9 {
+            let p = (rem % 100) as usize * 2;
+            rem /= 100;
+            digits[nd] = DIGIT_PAIRS[p + 1];
+            digits[nd + 1] = DIGIT_PAIRS[p];
+            nd += 2;
+        }
+        digits[nd] = rem as u8 + b'0';
+        nd += 1;
+    }
+    let mut rem = work[0];
+    while rem >= 100 {
+        let p = (rem % 100) as usize * 2;
+        rem /= 100;
+        digits[nd] = DIGIT_PAIRS[p + 1];
+        digits[nd + 1] = DIGIT_PAIRS[p];
+        nd += 2;
+    }
+    if rem >= 10 {
+        let p = rem as usize * 2;
+        digits[nd] = DIGIT_PAIRS[p + 1];
+        digits[nd + 1] = DIGIT_PAIRS[p];
+        nd += 2;
+    } else if rem != 0 {
+        digits[nd] = rem as u8 + b'0';
+        nd += 1;
     }
     // Guarantee at least one integer digit (possibly zero).
     if nd < frac_digits + 1 {
@@ -851,7 +948,7 @@ pub(crate) fn str_mag<'a>(
         None => {
             // Trim trailing zeros of the fractional part.
             let mut skip = 0;
-            while skip < frac_digits && digits[skip] == 0 {
+            while skip < frac_digits && digits[skip] == b'0' {
                 skip += 1;
             }
             frac_digits - skip
@@ -865,13 +962,13 @@ pub(crate) fn str_mag<'a>(
         }
         let start = frac_digits - print_frac.min(frac_digits);
         for digit in digits.iter().take(frac_digits).skip(start) {
-            push!(digit + b'0');
+            push!(*digit);
         }
         push!(b'.');
     }
 
     for digit in digits.iter().take(nd).skip(frac_digits) {
-        push!(digit + b'0');
+        push!(*digit);
     }
 
     let is_zero_val = is_zero(mag);
@@ -1168,12 +1265,61 @@ mod tests {
             ),
             Some("34028236692093846346337460743176821.1456")
         );
+        // 20-digit single-limb magnitude: the direct path, no chunk division.
+        assert_eq!(
+            str_mag(&m(u64::MAX), false, 4, None, AmountSign::Negative, &mut buf),
+            Some("1844674407370955.1615")
+        );
+        // 2^64, the smallest two-limb magnitude: one 19-digit chunk plus a
+        // single leading digit.
+        assert_eq!(
+            str_mag(
+                &[0, 1, 0, 0],
+                false,
+                0,
+                None,
+                AmountSign::Negative,
+                &mut buf
+            ),
+            Some("18446744073709551616")
+        );
+        // 10^20 = [7766279631452241920, 5]: the low chunk is all zeros, so
+        // the chunk path must still emit its 19 positional zero digits.
+        assert_eq!(
+            str_mag(
+                &[7766279631452241920, 5, 0, 0],
+                false,
+                0,
+                None,
+                AmountSign::Negative,
+                &mut buf
+            ),
+            Some("100000000000000000000")
+        );
         // Round-trip with the parser.
         let s = "-1234567890123456789012345678901234567890123456789012345.67891";
         let (neg, mag) = parse_decimal_mag_rounded::<4>(s, 5, crate::Rounding::HalfUp).unwrap();
         assert_eq!(
             str_mag(&mag, neg, 5, None, AmountSign::Negative, &mut buf),
             Some(s)
+        );
+        // Buffers under the fast-path minimum fall back to the general path
+        // with identical output, and still reject values that do not fit.
+        let mut small = [0u8; 8];
+        assert_eq!(
+            str_mag(&m(10001), true, 4, None, AmountSign::Negative, &mut small),
+            Some("-1.0001")
+        );
+        assert_eq!(
+            str_mag(
+                &m(u64::MAX),
+                false,
+                4,
+                None,
+                AmountSign::Negative,
+                &mut small
+            ),
+            None
         );
     }
 }

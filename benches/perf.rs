@@ -203,6 +203,14 @@ fn main() {
             let (a, b) = d_2w[i % PAIRS];
             a / b
         });
+        bench("rem  2w % 1w", |i| {
+            let (a, b) = d_big[i % PAIRS];
+            a % b
+        });
+        bench("rem  2w % 2w", |i| {
+            let (a, b) = d_2w[i % PAIRS];
+            a % b
+        });
         bench("round_to HalfEven", |i| {
             let (a, _) = m2x1[i % PAIRS];
             a.round_to(Rounding::HalfEven)
@@ -286,6 +294,18 @@ fn main() {
             sink.len = 0;
             write!(sink, "{}", black_box(v64)).unwrap();
             sink.len
+        });
+        bench("str_i64 (formatter core, no fmt machinery)", |_| {
+            let mut buf = [0u8; 32];
+            fin_decimal::str_i64(
+                black_box(12345678901),
+                4,
+                None,
+                fin_decimal::AmountSign::Negative,
+                &mut buf,
+            )
+            .unwrap()
+            .len()
         });
         bench("display Amount128 (34 digits)", |_| {
             sink.len = 0;

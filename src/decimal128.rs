@@ -12,8 +12,8 @@ use crate::AmountErrorKind;
 use crate::Rounding;
 use crate::ipow10_i128;
 use crate::limbs::{
-    cmp_twice_rem_u64, dec_div, dec_mul, div_rem_u128_pow10, parse_decimal_mag_rounded,
-    round_up_by_cmp, upow10,
+    cmp_twice_rem_u64, dec_div, dec_mul, div_knuth, div_rem_u128_pow10, div_words_by_word,
+    parse_decimal_mag_rounded, round_up_by_cmp, upow10,
 };
 use core::cmp::Ordering;
 use core::ops::*;
@@ -44,6 +44,36 @@ const fn i128_sign_mag(v: i128) -> (bool, [u64; 2]) {
 const fn i128_from_sign_mag(neg: bool, mag: [u64; 2]) -> i128 {
     let v = ((mag[0] as u128) | ((mag[1] as u128) << 64)) as i128;
     if neg { v.wrapping_neg() } else { v }
+}
+
+/// Truncated remainder `a % b` (`b != 0`) on sign-magnitude limbs. A native
+/// 128-bit `%` is a `__modti3` libcall on every architecture — no platform
+/// has a 128-by-128 division primitive — so this goes through the crate's
+/// word division ([`div_2by1`](crate::limbs::div_2by1) steps) instead, like
+/// [`Decimal256`](crate::Decimal256)'s remainder.
+fn i128_rem(a: i128, b: i128) -> i128 {
+    let neg = a < 0;
+    let am = a.unsigned_abs();
+    let bm = b.unsigned_abs();
+    let r = if bm >> 64 == 0 {
+        let mut q = [am as u64, (am >> 64) as u64];
+        div_words_by_word(&mut q, bm as u64) as u128
+    } else if am < bm {
+        am // the divisor is larger, so the dividend is the remainder
+    } else {
+        let mut q = [0u64];
+        let mut r = [0u64; 2];
+        div_knuth(
+            &mut q,
+            &mut r,
+            &[am as u64, (am >> 64) as u64],
+            &[bm as u64, (bm >> 64) as u64],
+        );
+        ((r[1] as u128) << 64) | r[0] as u128
+    };
+    // r < |b| <= 2^127 (and in the pass-through branch |a| < |b|), so the
+    // remainder always fits an i128 with either sign.
+    if neg { -(r as i128) } else { r as i128 }
 }
 
 impl<const DIGITS: u8> Decimal128<DIGITS> {
@@ -538,7 +568,9 @@ impl<const DIGITS: u8> Decimal128<DIGITS> {
     /// Returns the fractional part of a number.
     #[inline]
     pub const fn fract(self) -> Self {
-        Decimal128::<DIGITS>(self.0 % Self::SCALE_INT)
+        // Via the magnitude reciprocal path: a direct `%` by the scale
+        // constant would lower to a `__umodti3` call.
+        Decimal128::<DIGITS>(self.frac_rem())
     }
 
     /// Returns `true` if `self` is positive and `false` if the number is zero or negative.
@@ -807,9 +839,14 @@ impl<const DIGITS: u8> Div for Decimal128<DIGITS> {
 
 impl<const DIGITS: u8> Rem for Decimal128<DIGITS> {
     type Output = Self;
+    /// # Panics
+    /// Panics if `rhs` is zero.
     #[inline]
     fn rem(self, rhs: Self) -> Self {
-        Decimal128::<DIGITS>(self.0 % rhs.0)
+        if rhs.0 == 0 {
+            panic!("attempt to calculate the remainder with a divisor of zero");
+        }
+        Decimal128::<DIGITS>(i128_rem(self.0, rhs.0))
     }
 }
 
@@ -1065,6 +1102,7 @@ mod tests {
         const D: Amount128 = A.trunc();
         const E: Amount128 = Amount128::from_str_const("1.01").powi(12);
         const F: Option<Amount128> = A.checked_mul(A);
+        const G: Amount128 = A.fract();
 
         let a = Amount128::from_str("123456789012345.6789").unwrap();
         assert_eq!(A, a);
@@ -1073,6 +1111,60 @@ mod tests {
         assert_eq!(D, a.trunc());
         assert_eq!(E, Amount128::from_str("1.01").unwrap().powi(12));
         assert_eq!(F, a.checked_mul(a));
+        assert_eq!(G, a.fract());
+        assert_eq!(G.0, 6789);
+    }
+
+    /// The limb-based remainder must agree with the compiler's native i128
+    /// `%` across one- and two-limb divisors and all sign combinations.
+    #[test]
+    fn test_rem_wide() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+
+        // A signed value whose magnitude spans a random number of bits.
+        let mut rnd = move || {
+            let sh = (next() as u32) % 128;
+            let neg = next() & 1 != 0;
+            let m = ((((next() as u128) << 64) | next() as u128) >> sh) as i128;
+            if neg { m.wrapping_neg() } else { m }
+        };
+        for _ in 0..20000 {
+            let a = rnd();
+            let b = rnd();
+            if b == 0 {
+                continue;
+            }
+            assert_eq!(
+                (Decimal128::<4>(a) % Decimal128::<4>(b)).0,
+                a % b,
+                "{a} % {b}"
+            );
+        }
+
+        // Extremes: i128::MIN on either side, and |a| < |b|.
+        assert_eq!(
+            (Decimal128::<4>(i128::MIN) % Decimal128::<4>(3)).0,
+            i128::MIN % 3
+        );
+        assert_eq!(
+            (Decimal128::<4>(i128::MIN) % Decimal128::<4>(i128::MIN)).0,
+            0
+        );
+        assert_eq!((Decimal128::<4>(5) % Decimal128::<4>(i128::MIN)).0, 5);
+        assert_eq!((Decimal128::<4>(-5) % Decimal128::<4>(i128::MIN)).0, -5);
+        assert_eq!((Decimal128::<4>(-5) % Decimal128::<4>(5)).0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "divisor of zero")]
+    fn test_rem_by_zero() {
+        let _ = Amount128::from(1) % Amount128::ZERO;
     }
 
     /// Differential test: for values within the i64 range, Decimal128 must

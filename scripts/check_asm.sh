@@ -53,7 +53,8 @@ MUL_RE='mulq|mulxq|imulq|mull|imull'
 # 1) Constant re-scale paths must be division-free.
 for fn in probe_amount64_mul probe_amount128_mul probe_amount256_mul \
           probe_amount128_round probe_amount256_round \
-          probe_amount128_trunc probe_amount256_trunc; do
+          probe_amount128_trunc probe_amount256_trunc \
+          probe_amount128_fract; do
     b=$(body "$fn")
     if [ -z "$b" ]; then
         report "$fn" "FAIL" "function not found in assembly"
@@ -72,7 +73,8 @@ for fn in probe_amount64_mul probe_amount128_mul probe_amount256_mul \
 done
 
 # 2) Runtime-divisor division: div instructions are fine, builtins are not.
-for fn in probe_amount64_div probe_amount128_div probe_amount256_div; do
+for fn in probe_amount64_div probe_amount128_div probe_amount256_div \
+          probe_amount128_rem; do
     b=$(body "$fn")
     calls=$(printf '%s\n' "$b" | grep -cE 'call.*(udivti3|umodti3|divti3|modti3)' || true)
     divs=$(count "$b" "$DIV_RE")

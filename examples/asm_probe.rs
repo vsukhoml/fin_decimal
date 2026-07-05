@@ -62,6 +62,12 @@ pub fn probe_amount256_trunc(a: Amount256) -> Amount256 {
     a.trunc()
 }
 
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount128_fract(a: Amount128) -> Amount128 {
+    a.fract()
+}
+
 // ---- division by a runtime decimal: division instructions are expected,
 // ---- but never a call to the compiler's 128-bit builtins (__udivti3) ----
 
@@ -83,6 +89,12 @@ pub fn probe_amount256_div(a: Amount256, b: Amount256) -> Amount256 {
     a / b
 }
 
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount128_rem(a: Amount128, b: Amount128) -> Amount128 {
+    a % b
+}
+
 fn main() {
     // Call every probe so all of them are codegen'd.
     let a64 = black_box(Amount64::from(3));
@@ -99,7 +111,9 @@ fn main() {
     println!("{}", black_box(probe_amount256_round(a256)));
     println!("{}", black_box(probe_amount128_trunc(a128)));
     println!("{}", black_box(probe_amount256_trunc(a256)));
+    println!("{}", black_box(probe_amount128_fract(a128)));
     println!("{}", black_box(probe_amount64_div(a64, b64)));
     println!("{}", black_box(probe_amount128_div(a128, b128)));
     println!("{}", black_box(probe_amount256_div(a256, b256)));
+    println!("{}", black_box(probe_amount128_rem(a128, b128)));
 }

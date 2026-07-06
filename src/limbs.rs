@@ -31,15 +31,28 @@ use core::cmp::Ordering;
 /// can survive into codegen and defeat constant propagation entirely.
 #[inline]
 pub(crate) const fn upow10(pow: u32) -> u64 {
-    const P10: [u64; 20] = {
-        let mut t = [1u64; 20];
-        let mut i = 1;
-        while i < 20 {
-            t[i] = t[i - 1] * 10;
-            i += 1;
-        }
-        t
-    };
+    const P10: [u64; 20] = [
+        1,
+        10,
+        100,
+        1_000,
+        10_000,
+        100_000,
+        1_000_000,
+        10_000_000,
+        100_000_000,
+        1_000_000_000,
+        10_000_000_000,
+        100_000_000_000,
+        1_000_000_000_000,
+        10_000_000_000_000,
+        100_000_000_000_000,
+        1_000_000_000_000_000,
+        10_000_000_000_000_000,
+        100_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+        10_000_000_000_000_000_000,
+    ];
     P10[pow as usize]
 }
 
@@ -801,35 +814,17 @@ pub(crate) fn str_mag<'a>(
     buf: &'a mut [u8],
 ) -> Option<&'a str> {
     debug_assert!(frac_digits <= 19 && mag.len() <= 4);
-    // One spare limb: rounding up at a precision boundary can carry.
-    let mut work = [0u64; 5];
-    work[..mag.len()].copy_from_slice(mag);
-
-    if let Some(precision) = precision {
-        // If the requested precision cannot fit, bail out immediately.
-        if precision >= buf.len() {
-            return None;
-        }
-        // Round to the requested precision first (half away from zero), then
-        // scale back so digit extraction below stays uniform.
-        if precision < frac_digits {
-            let round_scale = upow10((frac_digits - precision) as u32);
-            let dropped = div_words_by_word(&mut work, round_scale);
-            if dropped.wrapping_shl(1) >= round_scale {
-                mul_add_word(&mut work, 1, 1);
-            }
-            mul_add_word(&mut work, round_scale, 0);
-        }
-    }
 
     // Fast path: a single-limb magnitude with default precision — every
-    // i64-backed value and typical wide-type magnitudes. Digits go straight
-    // into `buf` right-to-left, so there is no intermediate digit buffer and
-    // no second pass. At most 21 digits, the point and a sign are written
-    // (23 bytes), so with `buf.len() >= 24` the positions never underflow.
-    if precision.is_none() && buf.len() >= 24 && sig_limbs(&work) == 1 {
+    // i64-backed value and typical wide-type magnitudes. It reads `mag`
+    // directly, so the common case skips the working-copy memcpy entirely,
+    // and writes digits straight into `buf` right-to-left: no intermediate
+    // digit buffer and no second pass. At most 21 digits, the point and a
+    // sign are written (23 bytes), so with `buf.len() >= 24` the positions
+    // never underflow. (The `== 1` guard also proves `mag` is non-empty.)
+    if precision.is_none() && buf.len() >= 24 && sig_limbs(mag) == 1 {
         let mut pos = buf.len();
-        let mut v = work[0];
+        let mut v = mag[0];
         let is_zero_val = v == 0;
         // Trim trailing fractional zeros, then emit the remaining fraction.
         let mut fd = frac_digits;
@@ -885,6 +880,28 @@ pub(crate) fn str_mag<'a>(
         }
         // All bytes written are ASCII digits, '.', '+' or '-'.
         return core::str::from_utf8(&buf[pos..]).ok();
+    }
+
+    // Remaining paths mutate the magnitude, so take a working copy. One spare
+    // limb: rounding up at a precision boundary can carry.
+    let mut work = [0u64; 5];
+    work[..mag.len()].copy_from_slice(mag);
+
+    if let Some(precision) = precision {
+        // If the requested precision cannot fit, bail out immediately.
+        if precision >= buf.len() {
+            return None;
+        }
+        // Round to the requested precision first (half away from zero), then
+        // scale back so digit extraction below stays uniform.
+        if precision < frac_digits {
+            let round_scale = upow10((frac_digits - precision) as u32);
+            let dropped = div_words_by_word(&mut work, round_scale);
+            if dropped.wrapping_shl(1) >= round_scale {
+                mul_add_word(&mut work, 1, 1);
+            }
+            mul_add_word(&mut work, round_scale, 0);
+        }
     }
 
     // Extract ASCII digits, least significant first. While the value spans

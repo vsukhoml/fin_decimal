@@ -178,33 +178,14 @@ const fn i64_from_sign_mag(neg: bool, mag: [u64; 1]) -> i64 {
 }
 
 #[inline]
-// Compute pow of 10 for values 0..19 (which fits in i64 range)
-// Returns 1 if pow is negative and 0 if result will overflow
+// Compute pow of 10 for values 0..18 (which fits in i64 range)
+// Returns 1 if pow is negative and 0 if result will overflow.
+// Shares `limbs::upow10`'s power-of-ten table for the in-range lookup.
 const fn ipow10(pow: i64) -> i64 {
-    const P10: [i64; 18] = [
-        10,
-        100,
-        1000,
-        10000,
-        100000,
-        1000000,
-        10000000,
-        100000000,
-        1000000000,
-        10000000000,
-        100000000000,
-        1000000000000,
-        10000000000000,
-        100000000000000,
-        1000000000000000,
-        10000000000000000,
-        100000000000000000,
-        1000000000000000000,
-    ];
-    match (pow <= 0, pow > (P10.len() as i64)) {
+    match (pow <= 0, pow >= 19) {
         (true, _) => 1,
-        (_, true) => 0, // overflow
-        (_, _) => P10[pow as usize - 1],
+        (_, true) => 0, // 10^19 overflows i64 (max ≈ 9.22e18)
+        (_, _) => limbs::upow10(pow as u32) as i64,
     }
 }
 
@@ -212,19 +193,25 @@ const fn ipow10(pow: i64) -> i64 {
 // Compute 10^pow as i128 for non-negative `pow`.
 // Returns `None` if `pow` is negative or the result overflows i128.
 const fn ipow10_i128(pow: i64) -> Option<i128> {
-    if pow < 0 {
+    if pow < 0 || pow > 38 {
+        // 10^39 overflows i128.
         return None;
     }
-    let mut result: i128 = 1;
-    let mut i = 0i64;
+    // Low powers (10^0..10^19) fit in u64, so reuse the shared `upow10` table
+    // instead of duplicating those twenty values here at i128 width.
+    if pow <= 19 {
+        return Some(limbs::upow10(pow as u32) as i128);
+    }
+    // 10^20..10^38: extend the largest u64 power with a few multiplies. Only
+    // extreme exponents reach here, so a short loop is cheaper than carrying a
+    // 304-byte i128 table.
+    let mut v = limbs::upow10(19) as i128; // 10^19
+    let mut i = 19;
     while i < pow {
-        result = match result.checked_mul(10) {
-            Some(v) => v,
-            None => return None,
-        };
+        v *= 10;
         i += 1;
     }
-    Some(result)
+    Some(v)
 }
 
 #[test]
@@ -241,6 +228,23 @@ fn test_ipow10() {
         assert_eq!(ipow10(x), p);
         p *= 10;
     }
+}
+
+#[test]
+fn test_ipow10_i128() {
+    // Negative powers are rejected.
+    assert_eq!(ipow10_i128(-1), None);
+    // In-range powers match a from-scratch multiply, up to the last that fits.
+    let mut p: i128 = 1;
+    for x in 0..=38i64 {
+        assert_eq!(ipow10_i128(x), Some(p));
+        if x < 38 {
+            p *= 10;
+        }
+    }
+    // 10^39 overflows i128: the boundary that drives Overflow/Inexact.
+    assert_eq!(ipow10_i128(39), None);
+    assert_eq!(ipow10_i128(1000), None);
 }
 /// Defines how to display the sign of the parsed number.
 pub enum AmountSign {

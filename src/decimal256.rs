@@ -548,15 +548,23 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
 
     /// Multiply by another decimal, explicitly applying the given rounding mode.
     ///
+    /// The right-hand side may have a different scale: the exact product is
+    /// rounded once to `self`'s scale, so an amount times a high-precision
+    /// rate needs no intermediate conversion.
+    ///
     /// Usable in const contexts, so multiplication chains can be evaluated at
     /// compile time.
     ///
     /// # Panics
     /// Panics if the result overflows.
-    pub const fn mul_rounded(self, rhs: Self, mode: Rounding) -> Self {
+    pub const fn mul_rounded<const RHS_DIGITS: u8>(
+        self,
+        rhs: Decimal256<RHS_DIGITS>,
+        mode: Rounding,
+    ) -> Self {
         let (an, am) = self.0.to_sign_mag();
         let (bn, bm) = rhs.0.to_sign_mag();
-        match dec_mul::<DIGITS, 4, 8>(an, &am, bn, &bm, mode) {
+        match dec_mul::<RHS_DIGITS, 4, 8>(an, &am, bn, &bm, mode) {
             Some((neg, mag)) => match I256::from_sign_mag(neg, mag) {
                 Some(v) => Decimal256::<DIGITS>(v),
                 None => unreachable!(),
@@ -570,15 +578,51 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
     /// # Panics
     /// Panics if `rhs` is zero or the result overflows.
     pub fn div_rounded(self, rhs: Self, mode: Rounding) -> Self {
+        self.div_rounded_to::<DIGITS>(rhs, mode)
+    }
+
+    /// Divide by another decimal of the same scale, producing the quotient at
+    /// an explicitly chosen scale with the given rounding mode. The exact
+    /// quotient is rounded once at `TO_DIGITS` digits, so a proportion of two
+    /// amounts can be taken directly as a higher-precision rate.
+    ///
+    /// # Panics
+    /// Panics if `rhs` is zero or the result overflows.
+    pub fn div_rounded_to<const TO_DIGITS: u8>(
+        self,
+        rhs: Self,
+        mode: Rounding,
+    ) -> Decimal256<TO_DIGITS> {
         if rhs.0.is_zero() {
             panic!("Can't divide by zero");
         }
         let (an, am) = self.0.to_sign_mag();
         let (bn, bm) = rhs.0.to_sign_mag();
-        match dec_div::<DIGITS, 4, 5>(an, &am, bn, &bm, mode) {
-            Some((neg, mag)) => Decimal256::<DIGITS>(I256::from_sign_mag(neg, mag).unwrap()),
+        match dec_div::<TO_DIGITS, 4, 5>(an, &am, bn, &bm, mode) {
+            Some((neg, mag)) => Decimal256::<TO_DIGITS>(I256::from_sign_mag(neg, mag).unwrap()),
             None => panic!("attempt to divide with overflow"),
         }
+    }
+
+    /// Divide by an integer, explicitly applying the given rounding mode: the
+    /// exact quotient is rounded once at the type's own scale. The divisor is
+    /// a single word, so this is plain word division over the limbs.
+    ///
+    /// # Panics
+    /// Panics if `n` is zero. The result itself cannot overflow: its magnitude
+    /// never exceeds `self`'s (rounding up only happens for `|n| >= 2`).
+    pub fn div_int_rounded(self, n: i64, mode: Rounding) -> Self {
+        if n == 0 {
+            panic!("Can't divide by zero");
+        }
+        let (an, mut mag) = self.0.to_sign_mag();
+        let neg = an != (n < 0);
+        let d = n.unsigned_abs();
+        let r = div_words_by_word(&mut mag, d);
+        if round_up_by_cmp(cmp_twice_rem_u64(r, d), r == 0, mag[0] & 1 != 0, neg, mode) {
+            mul_add_word(&mut mag, 1, 1);
+        }
+        Decimal256::<DIGITS>(I256::from_sign_mag(neg, mag).unwrap())
     }
 
     /// Returns `true` if `self` is positive and `false` if the number is zero or negative.
@@ -1187,12 +1231,12 @@ mod tests {
             let db = Decimal128::<4>(b);
             let wa = Decimal256::<4>(I256::from_i128(a));
             let wb = Decimal256::<4>(I256::from_i128(b));
-            let to128 = |v: Decimal256<4>| {
+            fn to128<const D: u8>(v: Decimal256<D>) -> i128 {
                 let (neg, mag) = v.0.to_sign_mag();
                 assert_eq!(mag[2] | mag[3], 0);
                 let m = ((mag[0] as u128) | ((mag[1] as u128) << 64)) as i128;
                 if neg { -m } else { m }
-            };
+            }
 
             assert_eq!((da + db).0, to128(wa + wb));
             assert_eq!((da - db).0, to128(wa - wb));
@@ -1200,11 +1244,19 @@ mod tests {
             assert_eq!(format!("{da}"), format!("{wa}"));
             assert_eq!(format!("{da:.2}"), format!("{wa:.2}"));
 
+            // Cross-scale operands (an 8-digit rate) for mul_rounded.
+            let rb = Decimal128::<8>(b);
+            let wrb = Decimal256::<8>(I256::from_i128(b));
             for mode in [HalfUp, HalfDown, HalfEven, Down, Up] {
                 assert_eq!(
                     da.mul_rounded(db, mode).0,
                     to128(wa.mul_rounded(wb, mode)),
                     "mul_rounded {a} * {b}"
+                );
+                assert_eq!(
+                    da.mul_rounded(rb, mode).0,
+                    to128(wa.mul_rounded(wrb, mode)),
+                    "mul_rounded cross-scale {a} * {b}"
                 );
                 assert_eq!(
                     da.round_to(mode).0,
@@ -1217,6 +1269,18 @@ mod tests {
                         to128(wa.div_rounded(wb, mode)),
                         "div_rounded {a} / {b}"
                     );
+                    assert_eq!(
+                        da.div_rounded_to::<8>(db, mode).0,
+                        to128(wa.div_rounded_to::<8>(wb, mode)),
+                        "div_rounded_to::<8> {a} / {b}"
+                    );
+                    if let Ok(n) = i64::try_from(b) {
+                        assert_eq!(
+                            da.div_int_rounded(n, mode).0,
+                            to128(wa.div_int_rounded(n, mode)),
+                            "div_int_rounded {a} / {n}"
+                        );
+                    }
                 }
             }
             if b != 0 {

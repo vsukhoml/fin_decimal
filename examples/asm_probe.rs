@@ -13,7 +13,7 @@
 //! less target/release/examples/asm_probe-*.s
 //! ```
 
-use fin_decimal::{Amount64, Amount128, Amount256, I256, Rounding};
+use fin_decimal::{Amount64, Amount128, Amount256, I256, Rate64, Rate128, Rounding};
 use std::hint::black_box;
 
 // ---- multiplication: re-scale by constant 10^4, must be division-free ----
@@ -34,6 +34,20 @@ pub fn probe_amount128_mul(a: Amount128, b: Amount128) -> Amount128 {
 #[inline(never)]
 pub fn probe_amount256_mul(a: Amount256, b: Amount256) -> Amount256 {
     a * b
+}
+
+// ---- cross-scale multiplication: re-scale by constant 10^8 ----
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount64_mul_rate(a: Amount64, r: Rate64) -> Amount64 {
+    a.mul_rounded(r, Rounding::HalfUp)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount128_mul_rate(a: Amount128, r: Rate128) -> Amount128 {
+    a.mul_rounded(r, Rounding::HalfUp)
 }
 
 // ---- rounding: divide/multiply by constant 10^4, must be division-free ----
@@ -95,6 +109,18 @@ pub fn probe_amount128_rem(a: Amount128, b: Amount128) -> Amount128 {
     a % b
 }
 
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount64_ratio(a: Amount64, b: Amount64) -> Rate64 {
+    a.div_rounded_to::<8>(b, Rounding::HalfUp)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount128_div_int(a: Amount128, n: i64) -> Amount128 {
+    a.div_int_rounded(n, Rounding::HalfUp)
+}
+
 fn main() {
     // Call every probe so all of them are codegen'd.
     let a64 = black_box(Amount64::from(3));
@@ -104,9 +130,14 @@ fn main() {
     let a256 = black_box(Amount256::from(3));
     let b256 = black_box(Amount256::from_bits(I256::from_i128(10007)));
 
+    let r64 = black_box(Rate64::from_bits(10007));
+    let r128 = black_box(Rate128::from_bits(10007));
+
     println!("{}", black_box(probe_amount64_mul(a64, b64)));
     println!("{}", black_box(probe_amount128_mul(a128, b128)));
     println!("{}", black_box(probe_amount256_mul(a256, b256)));
+    println!("{}", black_box(probe_amount64_mul_rate(a64, r64)));
+    println!("{}", black_box(probe_amount128_mul_rate(a128, r128)));
     println!("{}", black_box(probe_amount128_round(a128)));
     println!("{}", black_box(probe_amount256_round(a256)));
     println!("{}", black_box(probe_amount128_trunc(a128)));
@@ -116,4 +147,9 @@ fn main() {
     println!("{}", black_box(probe_amount128_div(a128, b128)));
     println!("{}", black_box(probe_amount256_div(a256, b256)));
     println!("{}", black_box(probe_amount128_rem(a128, b128)));
+    println!("{}", black_box(probe_amount64_ratio(a64, b64)));
+    println!(
+        "{}",
+        black_box(probe_amount128_div_int(a128, black_box(10007)))
+    );
 }

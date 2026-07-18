@@ -1031,15 +1031,34 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
 
     /// Multiply by another decimal, explicitly applying the given rounding mode.
     ///
+    /// The right-hand side may have a different scale: the exact product is
+    /// rounded once to `self`'s scale, so an amount times a high-precision
+    /// rate needs no intermediate conversion.
+    ///
     /// Usable in const contexts, so multiplication chains can be evaluated at
     /// compile time.
     ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount64, Rate64, Rounding};
+    /// let amount = Amount64::from_str_const("125.00");
+    /// let rate = Rate64::from_str_const("0.0725"); // 7.25%, 8-digit scale
+    /// assert_eq!(
+    ///     amount.mul_rounded(rate, Rounding::HalfUp),
+    ///     Amount64::from_str_const("9.0625")
+    /// );
+    /// ```
+    ///
     /// # Panics
     /// Panics if the result overflows.
-    pub const fn mul_rounded(self, rhs: Self, mode: Rounding) -> Self {
+    pub const fn mul_rounded<const RHS_DIGITS: u8>(
+        self,
+        rhs: Decimal<RHS_DIGITS>,
+        mode: Rounding,
+    ) -> Self {
         let (an, am) = i64_sign_mag(self.0);
         let (bn, bm) = i64_sign_mag(rhs.0);
-        match limbs::dec_mul::<DIGITS, 1, 2>(an, &am, bn, &bm, mode) {
+        match limbs::dec_mul::<RHS_DIGITS, 1, 2>(an, &am, bn, &bm, mode) {
             Some((neg, mag)) => Decimal::<DIGITS>(i64_from_sign_mag(neg, mag)),
             None => panic!("attempt to multiply with overflow"),
         }
@@ -1050,15 +1069,82 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Panics
     /// Panics if `rhs` is zero or the result overflows.
     pub fn div_rounded(self, rhs: Self, mode: Rounding) -> Self {
+        self.div_rounded_to::<DIGITS>(rhs, mode)
+    }
+
+    /// Divide by another decimal of the same scale, producing the quotient at
+    /// an explicitly chosen scale with the given rounding mode. The exact
+    /// quotient is rounded once at `TO_DIGITS` digits, so a proportion of two
+    /// amounts can be taken directly as a higher-precision rate.
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount64, Rate64, Rounding};
+    /// let part = Amount64::from(2);
+    /// let whole = Amount64::from(3);
+    /// assert_eq!(
+    ///     part.div_rounded_to::<8>(whole, Rounding::HalfUp),
+    ///     Rate64::from_str_const("0.66666667")
+    /// );
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if `rhs` is zero or the result overflows.
+    pub fn div_rounded_to<const TO_DIGITS: u8>(
+        self,
+        rhs: Self,
+        mode: Rounding,
+    ) -> Decimal<TO_DIGITS> {
         if rhs.0 == 0 {
             panic!("Can't divide by zero");
         }
         let (an, am) = i64_sign_mag(self.0);
         let (bn, bm) = i64_sign_mag(rhs.0);
-        match limbs::dec_div::<DIGITS, 1, 2>(an, &am, bn, &bm, mode) {
-            Some((neg, mag)) => Decimal::<DIGITS>(i64_from_sign_mag(neg, mag)),
+        match limbs::dec_div::<TO_DIGITS, 1, 2>(an, &am, bn, &bm, mode) {
+            Some((neg, mag)) => Decimal::<TO_DIGITS>(i64_from_sign_mag(neg, mag)),
             None => panic!("attempt to divide with overflow"),
         }
+    }
+
+    /// Divide by an integer, explicitly applying the given rounding mode: the
+    /// exact quotient is rounded once at the type's own scale. Equivalent to
+    /// `div_rounded` by `Decimal::from(n)` but skips re-scaling the dividend,
+    /// staying a single native word division, and accepts any `i64` divisor
+    /// (converting a huge `n` could itself overflow).
+    ///
+    /// Usable in const contexts, so fixed splits can be evaluated at compile
+    /// time.
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount64, Rounding};
+    /// let total = Amount64::from_str_const("100.0001");
+    /// assert_eq!(
+    ///     total.div_int_rounded(3, Rounding::HalfUp),
+    ///     Amount64::from_str_const("33.3334")
+    /// );
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if `n` is zero. The result itself cannot overflow: its magnitude
+    /// never exceeds `self`'s (rounding up only happens for `|n| >= 2`).
+    pub const fn div_int_rounded(self, n: i64, mode: Rounding) -> Self {
+        if n == 0 {
+            panic!("Can't divide by zero");
+        }
+        let neg = (self.0 < 0) != (n < 0);
+        let a = self.0.unsigned_abs();
+        let d = n.unsigned_abs();
+        let q = a / d;
+        let r = a % d;
+        let up = limbs::round_up_by_cmp(
+            limbs::cmp_twice_rem_u64(r, d),
+            r == 0,
+            q & 1 != 0,
+            neg,
+            mode,
+        );
+        Decimal::<DIGITS>(i64_from_sign_mag(neg, [q + up as u64]))
     }
 
     #[inline]
@@ -1622,6 +1708,8 @@ mod tests {
     use crate::Amount64;
     use crate::AmountErrorKind;
     use crate::Decimal;
+    use crate::Rate64;
+    use crate::Rounding;
     use core::str::FromStr;
     use std::format;
 
@@ -2199,6 +2287,11 @@ mod tests {
         const DOUBLED: Option<Amount64> = PRICE.checked_mul(Amount64::from_str_const("2"));
         const GROWTH: Amount64 = Amount64::from_str_const("1.05").powi(10);
         const ROUNDED: Amount64 = TAX.round_to(Rounding::HalfUp);
+        // Cross-scale multiply (4-digit amount x 8-digit rate) and integer
+        // division both evaluate at compile time.
+        const FEE: Amount64 = PRICE.mul_rounded(Rate64::from_str_const("0.0725"), Rounding::HalfUp);
+        const SPLIT: Amount64 =
+            Amount64::from_str_const("100.0001").div_int_rounded(3, Rounding::HalfUp);
 
         assert_eq!(PRICE.0, 199_900);
         // Compile-time results match the runtime paths exactly.
@@ -2208,6 +2301,11 @@ mod tests {
         assert_eq!(DOUBLED, price.checked_mul(Amount64::from(2)));
         assert_eq!(GROWTH, Amount64::from_str("1.05").unwrap().powi(10));
         assert_eq!(ROUNDED, TAX.round_to(Rounding::HalfUp));
+        assert_eq!(
+            FEE,
+            price.mul_rounded(Rate64::from_str("0.0725").unwrap(), Rounding::HalfUp)
+        );
+        assert_eq!(SPLIT, Amount64::from_str("33.3334").unwrap());
         assert_eq!(
             Amount64::from_str_rounded("1.00005", Rounding::HalfEven),
             Ok(Decimal::<4>(10000))
@@ -2245,6 +2343,101 @@ mod tests {
             Decimal::<4>(3335).div_rounded(Decimal::<4>(20000), Rounding::HalfEven),
             Decimal::<4>(1668)
         );
+    }
+
+    #[test]
+    fn test_mul_rounded_cross_scale() {
+        use crate::Rounding::*;
+        // Amount (4 digits) x Rate (8 digits) rounds once to the amount's scale.
+        let amount = Amount64::from_str("125.00").unwrap();
+        let rate = Rate64::from_str("0.0725").unwrap();
+        assert_eq!(
+            amount.mul_rounded(rate, HalfUp),
+            Amount64::from_str("9.0625").unwrap()
+        );
+        // 1.0000 * 0.00005 = 0.00005: a tie at the 4-digit scale.
+        let tie = Rate64::from_str("0.00005").unwrap();
+        assert_eq!(Amount64::from(1).mul_rounded(tie, HalfUp).0, 1);
+        assert_eq!(Amount64::from(1).mul_rounded(tie, HalfEven).0, 0);
+        assert_eq!(Amount64::from(1).mul_rounded(tie, Down).0, 0);
+        assert_eq!(Amount64::from(-1).mul_rounded(tie, HalfUp).0, -1);
+        assert_eq!(Amount64::from(-1).mul_rounded(tie, Down).0, -1);
+        assert_eq!(Amount64::from(-1).mul_rounded(tie, Up).0, 0);
+    }
+
+    #[test]
+    fn test_div_rounded_to() {
+        use crate::Rounding::*;
+        // The quotient of two 4-digit amounts taken directly at 8 digits.
+        let two = Amount64::from(2);
+        let three = Amount64::from(3);
+        assert_eq!(two.div_rounded_to::<8>(three, HalfUp).0, 66_666_667);
+        assert_eq!(two.div_rounded_to::<8>(three, Down).0, 66_666_666);
+        assert_eq!((-two).div_rounded_to::<8>(three, Down).0, -66_666_667);
+        // Same target scale degenerates to div_rounded.
+        for mode in [HalfUp, HalfDown, HalfEven, Down, Up] {
+            assert_eq!(
+                two.div_rounded_to::<4>(three, mode),
+                two.div_rounded(three, mode)
+            );
+        }
+        // Down-scaling rounds correctly too: 2/3 at 1 digit is 0.7.
+        assert_eq!(two.div_rounded_to::<1>(three, HalfUp).0, 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "Can't divide by zero")]
+    fn test_div_rounded_to_by_zero() {
+        let _ = Amount64::from(1).div_rounded_to::<8>(Amount64::ZERO, Rounding::HalfUp);
+    }
+
+    #[test]
+    fn test_div_int_rounded() {
+        use crate::Rounding::*;
+        // Exact .00005 ties: 0.0001 / +-2 across modes and signs.
+        assert_eq!(Decimal::<4>(1).div_int_rounded(2, HalfUp).0, 1);
+        assert_eq!(Decimal::<4>(1).div_int_rounded(2, HalfDown).0, 0);
+        assert_eq!(Decimal::<4>(1).div_int_rounded(2, HalfEven).0, 0);
+        assert_eq!(Decimal::<4>(-1).div_int_rounded(2, HalfUp).0, -1);
+        assert_eq!(Decimal::<4>(1).div_int_rounded(-2, HalfUp).0, -1);
+        // Directional modes: Up is ceil, Down is floor.
+        assert_eq!(Decimal::<4>(1).div_int_rounded(3, Up).0, 1);
+        assert_eq!(Decimal::<4>(-1).div_int_rounded(3, Up).0, 0);
+        assert_eq!(Decimal::<4>(-1).div_int_rounded(3, Down).0, -1);
+        // Exact division never adjusts, whatever the mode.
+        assert_eq!(Amount64::MAX.div_int_rounded(1, Up), Amount64::MAX);
+        assert_eq!(Amount64::MAX.div_int_rounded(-1, Up), Amount64::MIN);
+
+        // Self-check: agrees with div_rounded by the same whole number.
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        for _ in 0..2000 {
+            let a = (next() as i64) >> 20;
+            let n = (next() as i64) >> 49;
+            if n == 0 {
+                continue;
+            }
+            let da = Decimal::<4>(a);
+            let dn = Decimal::<4>::from(n);
+            for mode in [HalfUp, HalfDown, HalfEven, Down, Up] {
+                assert_eq!(
+                    da.div_int_rounded(n, mode),
+                    da.div_rounded(dn, mode),
+                    "div_int_rounded {a} / {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Can't divide by zero")]
+    fn test_div_int_rounded_by_zero() {
+        let _ = Amount64::from(1).div_int_rounded(0, Rounding::HalfUp);
     }
 
     #[cfg(feature = "ufmt")]

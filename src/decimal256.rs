@@ -556,29 +556,54 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
     /// compile time.
     ///
     /// # Panics
-    /// Panics if the result overflows.
+    /// Panics if the result overflows (like core integer arithmetic in debug
+    /// builds); [`checked_mul_rounded`](Self::checked_mul_rounded) is the
+    /// non-panicking form.
     pub const fn mul_rounded<const RHS_DIGITS: u8>(
         self,
         rhs: Decimal256<RHS_DIGITS>,
         mode: Rounding,
     ) -> Self {
+        match self.checked_mul_rounded(rhs, mode) {
+            Some(v) => v,
+            None => panic!("attempt to multiply with overflow"),
+        }
+    }
+
+    /// Checked form of [`mul_rounded`](Self::mul_rounded): `None` if the
+    /// result overflows.
+    #[inline]
+    pub const fn checked_mul_rounded<const RHS_DIGITS: u8>(
+        self,
+        rhs: Decimal256<RHS_DIGITS>,
+        mode: Rounding,
+    ) -> Option<Self> {
         let (an, am) = self.0.to_sign_mag();
         let (bn, bm) = rhs.0.to_sign_mag();
         match dec_mul::<RHS_DIGITS, 4, 8>(an, &am, bn, &bm, mode) {
             Some((neg, mag)) => match I256::from_sign_mag(neg, mag) {
-                Some(v) => Decimal256::<DIGITS>(v),
+                Some(v) => Some(Decimal256::<DIGITS>(v)),
                 None => unreachable!(),
             },
-            None => panic!("attempt to multiply with overflow"),
+            None => None,
         }
     }
 
     /// Divide by another decimal, explicitly applying the given rounding mode.
     ///
     /// # Panics
-    /// Panics if `rhs` is zero or the result overflows.
+    /// Panics if `rhs` is zero (like core's `/`) or the result overflows;
+    /// [`checked_div_rounded`](Self::checked_div_rounded) is the
+    /// non-panicking form.
     pub fn div_rounded(self, rhs: Self, mode: Rounding) -> Self {
         self.div_rounded_to::<DIGITS>(rhs, mode)
+    }
+
+    /// Checked form of [`div_rounded`](Self::div_rounded): `None` if `rhs`
+    /// is zero or the result overflows.
+    #[inline]
+    pub fn checked_div_rounded(self, rhs: Self, mode: Rounding) -> Option<Self> {
+        self.checked_div_rounded_to::<DIGITS>(rhs, mode)
     }
 
     /// Divide by another decimal of the same scale, producing the quotient at
@@ -587,20 +612,36 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
     /// amounts can be taken directly as a higher-precision rate.
     ///
     /// # Panics
-    /// Panics if `rhs` is zero or the result overflows.
+    /// Panics if `rhs` is zero (like core's `/`) or the result overflows;
+    /// [`checked_div_rounded_to`](Self::checked_div_rounded_to) is the
+    /// non-panicking form.
     pub fn div_rounded_to<const TO_DIGITS: u8>(
         self,
         rhs: Self,
         mode: Rounding,
     ) -> Decimal256<TO_DIGITS> {
         if rhs.0.is_zero() {
-            panic!("Can't divide by zero");
+            panic!("attempt to divide by zero");
         }
+        match self.checked_div_rounded_to::<TO_DIGITS>(rhs, mode) {
+            Some(v) => v,
+            None => panic!("attempt to divide with overflow"),
+        }
+    }
+
+    /// Checked form of [`div_rounded_to`](Self::div_rounded_to): `None` if
+    /// `rhs` is zero or the result overflows.
+    #[inline]
+    pub fn checked_div_rounded_to<const TO_DIGITS: u8>(
+        self,
+        rhs: Self,
+        mode: Rounding,
+    ) -> Option<Decimal256<TO_DIGITS>> {
         let (an, am) = self.0.to_sign_mag();
         let (bn, bm) = rhs.0.to_sign_mag();
         match dec_div::<TO_DIGITS, 4, 5>(an, &am, bn, &bm, mode) {
-            Some((neg, mag)) => Decimal256::<TO_DIGITS>(I256::from_sign_mag(neg, mag).unwrap()),
-            None => panic!("attempt to divide with overflow"),
+            Some((neg, mag)) => Some(Decimal256::<TO_DIGITS>(I256::from_sign_mag(neg, mag)?)),
+            None => None,
         }
     }
 
@@ -609,11 +650,23 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
     /// a single word, so this is plain word division over the limbs.
     ///
     /// # Panics
-    /// Panics if `n` is zero. The result itself cannot overflow: its magnitude
+    /// Panics if `n` is zero (like core's `/`);
+    /// [`checked_div_int_rounded`](Self::checked_div_int_rounded) is the
+    /// non-panicking form. The result itself cannot overflow: its magnitude
     /// never exceeds `self`'s (rounding up only happens for `|n| >= 2`).
     pub fn div_int_rounded(self, n: i64, mode: Rounding) -> Self {
+        match self.checked_div_int_rounded(n, mode) {
+            Some(v) => v,
+            None => panic!("attempt to divide by zero"),
+        }
+    }
+
+    /// Checked form of [`div_int_rounded`](Self::div_int_rounded): `None`
+    /// only if `n` is zero (the result cannot overflow).
+    #[inline]
+    pub fn checked_div_int_rounded(self, n: i64, mode: Rounding) -> Option<Self> {
         if n == 0 {
-            panic!("Can't divide by zero");
+            return None;
         }
         let (an, mut mag) = self.0.to_sign_mag();
         let neg = an != (n < 0);
@@ -622,7 +675,12 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
         if round_up_by_cmp(cmp_twice_rem_u64(r, d), r == 0, mag[0] & 1 != 0, neg, mode) {
             mul_add_word(&mut mag, 1, 1);
         }
-        Decimal256::<DIGITS>(I256::from_sign_mag(neg, mag).unwrap())
+        // The magnitude only shrinks, so the sign-magnitude rebuild cannot
+        // fail.
+        match I256::from_sign_mag(neg, mag) {
+            Some(v) => Some(Decimal256::<DIGITS>(v)),
+            None => unreachable!(),
+        }
     }
 
     /// Returns `true` if `self` is positive and `false` if the number is zero or negative.

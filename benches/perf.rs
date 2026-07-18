@@ -269,6 +269,51 @@ fn main() {
         });
     }
 
+    // ---------------- square root ----------------
+    println!("\nSquare root (u128 -> u64 cores, plus the public API):");
+    {
+        use fin_decimal::bench_internals::{isqrt_f64, isqrt_newton};
+        // Money-sized (mantissa*10^4 ~ 2^47) and full-range (~2^120) inputs.
+        let small: Vec<u128> = (0..PAIRS).map(|_| rng.bits(47)).collect();
+        let big: Vec<u128> = (0..PAIRS).map(|_| rng.bits(120)).collect();
+        bench("isqrt f64-seeded Newton (small)", |i| {
+            isqrt_f64(black_box(small[i % PAIRS]))
+        });
+        bench("isqrt f64-seeded Newton (2^120)", |i| {
+            isqrt_f64(black_box(big[i % PAIRS]))
+        });
+        bench("isqrt integer Newton    (small)", |i| {
+            isqrt_newton(black_box(small[i % PAIRS]))
+        });
+        bench("isqrt integer Newton    (2^120)", |i| {
+            isqrt_newton(black_box(big[i % PAIRS]))
+        });
+        bench("isqrt core u128::isqrt  (small)", |i| {
+            black_box(small[i % PAIRS]).isqrt()
+        });
+        bench("isqrt core u128::isqrt  (2^120)", |i| {
+            black_box(big[i % PAIRS]).isqrt()
+        });
+        let money: Vec<Amount64> = (0..PAIRS)
+            .map(|_| Amount64::from_bits(rng.bits(43) as u64))
+            .collect();
+        let wide: Vec<Amount64> = (0..PAIRS)
+            .map(|_| Amount64::from_bits(rng.bits(62) as u64))
+            .collect();
+        bench("Amount64 sqrt_rounded (money, u64::isqrt path)", |i| {
+            money[i % PAIRS].sqrt_rounded(Rounding::HalfUp)
+        });
+        bench("Amount64 sqrt_rounded (wide, f64 core path)", |i| {
+            wide[i % PAIRS].sqrt_rounded(Rounding::HalfUp)
+        });
+        bench("Amount64 mul_div_rounded", |i| {
+            let a = money[i % PAIRS];
+            let b = money[(i + 7) % PAIRS];
+            let c = money[(i + 13) % PAIRS];
+            a.mul_div_rounded(b, c, Rounding::HalfUp)
+        });
+    }
+
     // ---------------- string conversions ----------------
     println!("\nString conversions:");
     {

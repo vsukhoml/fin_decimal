@@ -50,6 +50,14 @@ pub fn probe_amount128_mul_rate(a: Amount128, r: Rate128) -> Amount128 {
     a.mul_rounded(r, Rounding::HalfUp)
 }
 
+// ---- square root: constant re-scale + u128::isqrt, must be division-free ----
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount64_sqrt(a: Amount64) -> Amount64 {
+    a.sqrt_rounded(Rounding::HalfUp)
+}
+
 // ---- rounding: divide/multiply by constant 10^4, must be division-free ----
 
 #[unsafe(no_mangle)]
@@ -121,6 +129,12 @@ pub fn probe_amount128_div_int(a: Amount128, n: i64) -> Amount128 {
     a.div_int_rounded(n, Rounding::HalfUp)
 }
 
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount64_mul_div(a: Amount64, b: Amount64, c: Amount64) -> Amount64 {
+    a.mul_div_rounded(b, c, Rounding::HalfUp)
+}
+
 fn main() {
     // Call every probe so all of them are codegen'd.
     let a64 = black_box(Amount64::from(3));
@@ -152,4 +166,6 @@ fn main() {
         "{}",
         black_box(probe_amount128_div_int(a128, black_box(10007)))
     );
+    println!("{}", black_box(probe_amount64_sqrt(a64)));
+    println!("{}", black_box(probe_amount64_mul_div(a64, b64, b64)));
 }

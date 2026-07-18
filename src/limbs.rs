@@ -678,6 +678,95 @@ pub(crate) const fn cmp_twice_rem_u64(rem: u64, d: u64) -> Ordering {
     }
 }
 
+/// Floor square root of a `u128`, seeded from an `f64` reciprocal-sqrt
+/// estimate and refined with multiply-only Newton steps — no division
+/// instructions and no libcalls anywhere (`core` has no `f64::sqrt`, and a
+/// `u128` division here would be a `__udivti3` call), so it is usable in
+/// const and stays fast at runtime.
+///
+/// Steps: the classic exponent-halving bit trick gives `y ~ 1/sqrt(n)` to
+/// ~3%; four Newton iterations for the *reciprocal* square root
+/// (`y *= 1.5 - 0.5*n*y*y`, multiply-only) converge quadratically to f64
+/// precision; `n * y` is then `sqrt(n)` within a few thousand ULPs (f64
+/// carries 53 bits, the result up to 64). One further Newton step on the
+/// exact integer residual — `s += (n - s^2) / (2s)`, with the division again
+/// a multiplication by `y` — lands within ~1, and a short walk pins the
+/// exact floor.
+///
+/// Requires `n < 2^127` (all callers pass at most `i64::MAX * 10^19 <
+/// 2^127`), which keeps every intermediate square inside `u128`.
+///
+/// Benchmarks (`cargo bench`, "Square root") put this at ~31 ns/op flat
+/// across magnitudes — beating the pure integer Newton on wide inputs.
+/// Core's table-seeded `u128::isqrt` is faster still on x86, but its
+/// codegen contains a `__udivti3` libcall, which the crate bans; the
+/// public `sqrt` API therefore uses `u64::isqrt` (native word divisions
+/// only) for single-limb inputs and this core for wider ones. Pinned to
+/// `u128::isqrt` by tests along with [`isqrt_newton`].
+pub const fn isqrt_f64(n: u128) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    debug_assert!(n >> 127 == 0);
+    let nf = n as f64;
+    let mut y = f64::from_bits(0x5FE6EB50C7B537A9u64.wrapping_sub(nf.to_bits() >> 1));
+    let mut i = 0;
+    while i < 4 {
+        y = y * (1.5 - 0.5 * nf * y * y);
+        i += 1;
+    }
+    // `nf * y` is within 2^-49 relative of sqrt(n) < 2^63.5, so `s` stays
+    // well below 2^64 and `s * s` cannot overflow (or wrap) below.
+    let s0 = (nf * y) as u128;
+    let s2 = s0 * s0;
+    let mut s = if n >= s2 {
+        s0 + (((n - s2) as f64) * (0.5 * y)) as u128
+    } else {
+        s0.saturating_sub((((s2 - n) as f64) * (0.5 * y)) as u128)
+    };
+    while s > 0 && s * s > n {
+        s -= 1;
+    }
+    while (s + 1) * (s + 1) <= n {
+        s += 1;
+    }
+    s as u64
+}
+
+/// Floor square root of a `u128` by pure integer Newton (Heron) iteration:
+/// the seed `2^ceil(bits/2)` overshoots `sqrt(n)`, and each step
+/// `x = (x + n/x) / 2` runs `n / x` through [`div_words_by_word`] (so the
+/// `asm` feature's `div_2by1` applies and no `__udivti3` is ever emitted).
+/// The strictly decreasing sequence stops exactly at the floor. ~6-7
+/// division steps against [`isqrt_f64`]'s zero: ~20 ns/op on money-sized
+/// inputs but ~60 ns at 2^120 (the iteration count grows with magnitude).
+/// Kept as the measured comparison implementation, pinned to
+/// `u128::isqrt` by tests.
+pub fn isqrt_newton(n: u128) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let bits = 128 - n.leading_zeros();
+    let shift = bits.div_ceil(2);
+    let div = |x: u128| {
+        let mut q = [n as u64, (n >> 64) as u64];
+        // The seed can be exactly 2^64 (one bit past a word); its quotient
+        // is a plain shift. Every later iterate fits a word.
+        if x >> 64 != 0 {
+            return n >> 64;
+        }
+        div_words_by_word(&mut q, x as u64);
+        (q[0] as u128) | ((q[1] as u128) << 64)
+    };
+    let mut x0: u128 = 1 << shift;
+    let mut x1 = (x0 + div(x0)) >> 1;
+    while x1 < x0 {
+        x0 = x1;
+        x1 = (x0 + div(x0)) >> 1;
+    }
+    x0 as u64
+}
+
 /// Converts a decimal string into a sign and a 4-limb magnitude scaled by
 /// 10^`scale`, rounding excess fractional digits with `mode`.
 ///
@@ -1338,5 +1427,38 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn test_isqrt_cores() {
+        // Both custom cores must agree exactly with core's u128::isqrt.
+        let check = |n: u128| {
+            let want = n.isqrt() as u64;
+            assert_eq!(isqrt_f64(n), want, "isqrt_f64({n})");
+            assert_eq!(isqrt_newton(n), want, "isqrt_newton({n})");
+        };
+        for n in 0..2000u128 {
+            check(n);
+        }
+        // Perfect squares and their neighbours across the whole width.
+        for bit in 1..63u32 {
+            let k = (1u128 << bit) - 1;
+            for s in [k * k, k * k + 1, k * k + 2 * k] {
+                check(s);
+            }
+        }
+        // The largest value any backing feeds in: i64::MAX * 10^19.
+        let top = i64::MAX as u128 * POW10_19 as u128;
+        for n in [top, top - 1, 1 << 126, (1 << 126) + 1, (1 << 127) - 1] {
+            check(n);
+        }
+        // Random values over mixed magnitudes.
+        let mut rng = Rng(0x5851F42D4C957F2D);
+        for i in 0..20000u32 {
+            let bits = 1 + (i % 127);
+            let top = 1u128 << (bits - 1);
+            let n = top | (((rng.next() as u128) << 64 | rng.next() as u128) & (top - 1));
+            check(n);
+        }
     }
 }

@@ -118,6 +118,14 @@ mod limbs;
 pub use decimal128::{Amount128, Decimal128, Rate128};
 pub use decimal256::{Amount256, Decimal256, I256, Rate256};
 
+/// Not public API: internals re-exported only so the dependency-free bench
+/// harness (`benches/perf.rs`) can compare the square-root cores against
+/// each other. No stability guarantees whatsoever.
+#[doc(hidden)]
+pub mod bench_internals {
+    pub use crate::limbs::{isqrt_f64, isqrt_newton};
+}
+
 /// Enum to store the various types of errors that can cause parsing an integer to fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AmountErrorKind {
@@ -416,7 +424,7 @@ pub const fn parse_decimal_i64_rounded(
 /// 4.5 -> 4, 4.51 -> 5,  1.4999 -> 1
 /// `Rounding::Down` - Always round down.
 /// `Rounding::Up` - Always round up.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rounding {
     /// Rounds toward the nearest even number, e.g. 5.5 -> 6, 4.5 -> 4
     HalfEven,
@@ -1050,26 +1058,51 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// ```
     ///
     /// # Panics
-    /// Panics if the result overflows.
+    /// Panics if the result overflows (like core integer arithmetic in debug
+    /// builds); [`checked_mul_rounded`](Self::checked_mul_rounded) is the
+    /// non-panicking form.
     pub const fn mul_rounded<const RHS_DIGITS: u8>(
         self,
         rhs: Decimal<RHS_DIGITS>,
         mode: Rounding,
     ) -> Self {
+        match self.checked_mul_rounded(rhs, mode) {
+            Some(v) => v,
+            None => panic!("attempt to multiply with overflow"),
+        }
+    }
+
+    /// Checked form of [`mul_rounded`](Self::mul_rounded): `None` if the
+    /// result overflows.
+    #[inline]
+    pub const fn checked_mul_rounded<const RHS_DIGITS: u8>(
+        self,
+        rhs: Decimal<RHS_DIGITS>,
+        mode: Rounding,
+    ) -> Option<Self> {
         let (an, am) = i64_sign_mag(self.0);
         let (bn, bm) = i64_sign_mag(rhs.0);
         match limbs::dec_mul::<RHS_DIGITS, 1, 2>(an, &am, bn, &bm, mode) {
-            Some((neg, mag)) => Decimal::<DIGITS>(i64_from_sign_mag(neg, mag)),
-            None => panic!("attempt to multiply with overflow"),
+            Some((neg, mag)) => Some(Decimal::<DIGITS>(i64_from_sign_mag(neg, mag))),
+            None => None,
         }
     }
 
     /// Divide by another decimal, explicitly applying the given rounding mode.
     ///
     /// # Panics
-    /// Panics if `rhs` is zero or the result overflows.
+    /// Panics if `rhs` is zero (like core's `/`) or the result overflows;
+    /// [`checked_div_rounded`](Self::checked_div_rounded) is the
+    /// non-panicking form.
     pub fn div_rounded(self, rhs: Self, mode: Rounding) -> Self {
         self.div_rounded_to::<DIGITS>(rhs, mode)
+    }
+
+    /// Checked form of [`div_rounded`](Self::div_rounded): `None` if `rhs`
+    /// is zero or the result overflows.
+    #[inline]
+    pub fn checked_div_rounded(self, rhs: Self, mode: Rounding) -> Option<Self> {
+        self.checked_div_rounded_to::<DIGITS>(rhs, mode)
     }
 
     /// Divide by another decimal of the same scale, producing the quotient at
@@ -1089,21 +1122,35 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// ```
     ///
     /// # Panics
-    /// Panics if `rhs` is zero or the result overflows.
+    /// Panics if `rhs` is zero (like core's `/`) or the result overflows;
+    /// [`checked_div_rounded_to`](Self::checked_div_rounded_to) is the
+    /// non-panicking form.
     pub fn div_rounded_to<const TO_DIGITS: u8>(
         self,
         rhs: Self,
         mode: Rounding,
     ) -> Decimal<TO_DIGITS> {
         if rhs.0 == 0 {
-            panic!("Can't divide by zero");
+            panic!("attempt to divide by zero");
         }
-        let (an, am) = i64_sign_mag(self.0);
-        let (bn, bm) = i64_sign_mag(rhs.0);
-        match limbs::dec_div::<TO_DIGITS, 1, 2>(an, &am, bn, &bm, mode) {
-            Some((neg, mag)) => Decimal::<TO_DIGITS>(i64_from_sign_mag(neg, mag)),
+        match self.checked_div_rounded_to::<TO_DIGITS>(rhs, mode) {
+            Some(v) => v,
             None => panic!("attempt to divide with overflow"),
         }
+    }
+
+    /// Checked form of [`div_rounded_to`](Self::div_rounded_to): `None` if
+    /// `rhs` is zero or the result overflows.
+    #[inline]
+    pub fn checked_div_rounded_to<const TO_DIGITS: u8>(
+        self,
+        rhs: Self,
+        mode: Rounding,
+    ) -> Option<Decimal<TO_DIGITS>> {
+        let (an, am) = i64_sign_mag(self.0);
+        let (bn, bm) = i64_sign_mag(rhs.0);
+        limbs::dec_div::<TO_DIGITS, 1, 2>(an, &am, bn, &bm, mode)
+            .map(|(neg, mag)| Decimal::<TO_DIGITS>(i64_from_sign_mag(neg, mag)))
     }
 
     /// Divide by an integer, explicitly applying the given rounding mode: the
@@ -1126,11 +1173,23 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// ```
     ///
     /// # Panics
-    /// Panics if `n` is zero. The result itself cannot overflow: its magnitude
+    /// Panics if `n` is zero (like core's `/`);
+    /// [`checked_div_int_rounded`](Self::checked_div_int_rounded) is the
+    /// non-panicking form. The result itself cannot overflow: its magnitude
     /// never exceeds `self`'s (rounding up only happens for `|n| >= 2`).
     pub const fn div_int_rounded(self, n: i64, mode: Rounding) -> Self {
+        match self.checked_div_int_rounded(n, mode) {
+            Some(v) => v,
+            None => panic!("attempt to divide by zero"),
+        }
+    }
+
+    /// Checked form of [`div_int_rounded`](Self::div_int_rounded): `None`
+    /// only if `n` is zero (the result cannot overflow).
+    #[inline]
+    pub const fn checked_div_int_rounded(self, n: i64, mode: Rounding) -> Option<Self> {
         if n == 0 {
-            panic!("Can't divide by zero");
+            return None;
         }
         let neg = (self.0 < 0) != (n < 0);
         let a = self.0.unsigned_abs();
@@ -1144,7 +1203,171 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
             neg,
             mode,
         );
-        Decimal::<DIGITS>(i64_from_sign_mag(neg, [q + up as u64]))
+        Some(Decimal::<DIGITS>(i64_from_sign_mag(neg, [q + up as u64])))
+    }
+
+    /// Square root with the given rounding mode, or `None` for a negative
+    /// value or (only possible at `DIGITS = 19`, where every value is below
+    /// one and a square root therefore *grows*) result overflow.
+    ///
+    /// The exact root of `self` is rounded once at the type's own scale:
+    /// the result is the correctly rounded decimal square root, computed as
+    /// the integer square root of `mantissa * 10^DIGITS`. For the half
+    /// modes a tie cannot occur (`(s + 1/2)^2` is never an integer), so
+    /// `HalfUp`, `HalfDown` and `HalfEven` always agree here.
+    ///
+    /// Usable in const contexts.
+    pub const fn checked_sqrt_rounded(self, mode: Rounding) -> Option<Self> {
+        if self.0 < 0 {
+            return None;
+        }
+        let n = self.0 as u128 * const { limbs::upow10(DIGITS as u32) } as u128;
+        // Single-limb inputs (typical money magnitudes) take core's
+        // `u64::isqrt` (native word divisions only); wider ones take the
+        // crate's division-free f64-seeded Newton core. `u128::isqrt` would
+        // be the obvious choice — and benches fastest on x86 — but its
+        // codegen contains a `__udivti3` libcall, which the crate bans
+        // (software division on most non-x86 targets); the asm probes hold
+        // this path to no-128-bit-builtins.
+        let s = if n >> 64 == 0 {
+            (n as u64).isqrt()
+        } else {
+            limbs::isqrt_f64(n)
+        };
+        let rem = n - s as u128 * s as u128;
+        let up = match mode {
+            Rounding::Down => false,
+            Rounding::Up => rem != 0,
+            // Half modes, tie-free: round up iff n > s^2 + s, i.e. n is
+            // past (s + 1/2)^2.
+            _ => rem > s as u128,
+        };
+        let mag = s + up as u64;
+        if mag >> 63 != 0 {
+            return None;
+        }
+        Some(Decimal::<DIGITS>(mag as i64))
+    }
+
+    /// Square root, explicitly applying the given rounding mode. See
+    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded).
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount64, Rounding};
+    /// let two = Amount64::from(2);
+    /// assert_eq!(two.sqrt_rounded(Rounding::HalfUp), Amount64::from_str_const("1.4142"));
+    /// assert_eq!(two.sqrt_rounded(Rounding::Up), Amount64::from_str_const("1.4143"));
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if `self` is negative (with core's `isqrt` message) or the
+    /// result overflows;
+    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded) is the
+    /// non-panicking form.
+    pub const fn sqrt_rounded(self, mode: Rounding) -> Self {
+        if self.0 < 0 {
+            panic!("argument of integer square root cannot be negative");
+        }
+        match self.checked_sqrt_rounded(mode) {
+            Some(v) => v,
+            None => panic!("attempt to compute square root with overflow"),
+        }
+    }
+
+    /// Square root, rounded half-up at the type's own scale (the operators'
+    /// default rounding). See
+    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded).
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::Amount64;
+    /// assert_eq!(Amount64::from_str_const("2.25").sqrt(), Amount64::from_str_const("1.5"));
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if `self` is negative or the result overflows;
+    /// [`checked_sqrt`](Self::checked_sqrt) is the non-panicking form.
+    pub const fn sqrt(self) -> Self {
+        self.sqrt_rounded(Rounding::HalfUp)
+    }
+
+    /// Checked form of [`sqrt`](Self::sqrt) (half-up rounding), mirroring
+    /// core's `checked_isqrt` on signed integers: `None` for a negative
+    /// value (or overflow, see
+    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded)).
+    #[inline]
+    pub const fn checked_sqrt(self) -> Option<Self> {
+        self.checked_sqrt_rounded(Rounding::HalfUp)
+    }
+
+    /// `self * b / c` on the exact 128-bit product with a single rounding at
+    /// the end, or `None` if `c` is zero or the result overflows.
+    ///
+    /// The muldiv/pro-rata primitive: allocating an amount by the proportion
+    /// `b / c` this way avoids the double rounding of first taking the ratio
+    /// and then multiplying by it. `b` and `c` share a scale — any scale,
+    /// since it cancels in `b / c` — and the result keeps `self`'s scale.
+    pub fn checked_mul_div_rounded<const S: u8>(
+        self,
+        b: Decimal<S>,
+        c: Decimal<S>,
+        mode: Rounding,
+    ) -> Option<Self> {
+        if c.0 == 0 {
+            return None;
+        }
+        let neg = ((self.0 < 0) != (b.0 < 0)) != (c.0 < 0);
+        let num = self.0.unsigned_abs() as u128 * b.0.unsigned_abs() as u128;
+        let d = c.0.unsigned_abs();
+        let mut mag = [num as u64, (num >> 64) as u64];
+        let r = limbs::div_words_by_word(&mut mag, d);
+        if limbs::round_up_by_cmp(
+            limbs::cmp_twice_rem_u64(r, d),
+            r == 0,
+            mag[0] & 1 != 0,
+            neg,
+            mode,
+        ) && limbs::mul_add_word(&mut mag, 1, 1)
+        {
+            return None;
+        }
+        if mag[1] != 0 || mag[0] >> 63 != 0 {
+            return None;
+        }
+        Some(Decimal::<DIGITS>(i64_from_sign_mag(neg, [mag[0]])))
+    }
+
+    /// `self * b / c` on the exact 128-bit product with a single rounding at
+    /// the end. See
+    /// [`checked_mul_div_rounded`](Self::checked_mul_div_rounded).
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount64, Rounding};
+    /// // Allocate a total pro rata by 1/3 without an intermediate rate.
+    /// let total = Amount64::from_str_const("100.00");
+    /// let share = total.mul_div_rounded(Amount64::from(1), Amount64::from(3), Rounding::HalfUp);
+    /// assert_eq!(share, Amount64::from_str_const("33.3333"));
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if `c` is zero (like core's `/`) or the result overflows;
+    /// [`checked_mul_div_rounded`](Self::checked_mul_div_rounded) is the
+    /// non-panicking form.
+    pub fn mul_div_rounded<const S: u8>(
+        self,
+        b: Decimal<S>,
+        c: Decimal<S>,
+        mode: Rounding,
+    ) -> Self {
+        if c.0 == 0 {
+            panic!("attempt to divide by zero");
+        }
+        match self.checked_mul_div_rounded(b, c, mode) {
+            Some(v) => v,
+            None => panic!("attempt to multiply with overflow"),
+        }
     }
 
     #[inline]
@@ -2292,6 +2515,8 @@ mod tests {
         const FEE: Amount64 = PRICE.mul_rounded(Rate64::from_str_const("0.0725"), Rounding::HalfUp);
         const SPLIT: Amount64 =
             Amount64::from_str_const("100.0001").div_int_rounded(3, Rounding::HalfUp);
+        // Square roots evaluate at compile time too.
+        const ROOT2: Amount64 = Amount64::from_str_const("2").sqrt();
 
         assert_eq!(PRICE.0, 199_900);
         // Compile-time results match the runtime paths exactly.
@@ -2306,6 +2531,8 @@ mod tests {
             price.mul_rounded(Rate64::from_str("0.0725").unwrap(), Rounding::HalfUp)
         );
         assert_eq!(SPLIT, Amount64::from_str("33.3334").unwrap());
+        assert_eq!(ROOT2, Amount64::from(2).sqrt());
+        assert_eq!(ROOT2.0, 14142);
         assert_eq!(
             Amount64::from_str_rounded("1.00005", Rounding::HalfEven),
             Ok(Decimal::<4>(10000))
@@ -2355,6 +2582,15 @@ mod tests {
             amount.mul_rounded(rate, HalfUp),
             Amount64::from_str("9.0625").unwrap()
         );
+        // Checked form: overflow becomes None instead of a panic.
+        assert_eq!(
+            Amount64::MAX.checked_mul_rounded(Amount64::from(2), HalfUp),
+            None
+        );
+        assert_eq!(
+            amount.checked_mul_rounded(rate, HalfUp),
+            Some(amount.mul_rounded(rate, HalfUp))
+        );
         // 1.0000 * 0.00005 = 0.00005: a tie at the 4-digit scale.
         let tie = Rate64::from_str("0.00005").unwrap();
         assert_eq!(Amount64::from(1).mul_rounded(tie, HalfUp).0, 1);
@@ -2383,10 +2619,30 @@ mod tests {
         }
         // Down-scaling rounds correctly too: 2/3 at 1 digit is 0.7.
         assert_eq!(two.div_rounded_to::<1>(three, HalfUp).0, 7);
+        // Checked forms: zero divisor and overflow become None, everything
+        // else matches the panicking form.
+        assert_eq!(
+            two.checked_div_rounded_to::<8>(Amount64::ZERO, HalfUp),
+            None
+        );
+        assert_eq!(
+            Amount64::MAX
+                .checked_div_rounded_to::<8>(Amount64::from_str("0.0001").unwrap(), HalfUp),
+            None
+        );
+        assert_eq!(
+            two.checked_div_rounded_to::<8>(three, HalfUp),
+            Some(two.div_rounded_to::<8>(three, HalfUp))
+        );
+        assert_eq!(
+            two.checked_div_rounded(three, HalfUp),
+            Some(two.div_rounded(three, HalfUp))
+        );
+        assert_eq!(two.checked_div_rounded(Amount64::ZERO, HalfUp), None);
     }
 
     #[test]
-    #[should_panic(expected = "Can't divide by zero")]
+    #[should_panic(expected = "attempt to divide by zero")]
     fn test_div_rounded_to_by_zero() {
         let _ = Amount64::from(1).div_rounded_to::<8>(Amount64::ZERO, Rounding::HalfUp);
     }
@@ -2407,6 +2663,12 @@ mod tests {
         // Exact division never adjusts, whatever the mode.
         assert_eq!(Amount64::MAX.div_int_rounded(1, Up), Amount64::MAX);
         assert_eq!(Amount64::MAX.div_int_rounded(-1, Up), Amount64::MIN);
+        // Checked form: None only on a zero divisor.
+        assert_eq!(Amount64::from(1).checked_div_int_rounded(0, HalfUp), None);
+        assert_eq!(
+            Amount64::from(1).checked_div_int_rounded(3, HalfUp),
+            Some(Amount64::from(1).div_int_rounded(3, HalfUp))
+        );
 
         // Self-check: agrees with div_rounded by the same whole number.
         let mut state = 0x9E3779B97F4A7C15u64;
@@ -2435,9 +2697,185 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Can't divide by zero")]
+    #[should_panic(expected = "attempt to divide by zero")]
     fn test_div_int_rounded_by_zero() {
         let _ = Amount64::from(1).div_int_rounded(0, Rounding::HalfUp);
+    }
+
+    #[test]
+    fn test_sqrt() {
+        use crate::Rounding::*;
+        // Exact roots stay exact in every mode.
+        for mode in [HalfUp, HalfDown, HalfEven, Down, Up] {
+            assert_eq!(
+                Amount64::from_str("2.25").unwrap().sqrt_rounded(mode),
+                Amount64::from_str("1.5").unwrap()
+            );
+            assert_eq!(Amount64::from(144).sqrt_rounded(mode), Amount64::from(12));
+            assert_eq!(Amount64::ZERO.sqrt_rounded(mode), Amount64::ZERO);
+        }
+        // sqrt(2) = 1.41421356...: Down truncates, Up ceils, halves round.
+        let two = Amount64::from(2);
+        assert_eq!(two.sqrt().0, 14142);
+        assert_eq!(two.sqrt_rounded(Down).0, 14142);
+        assert_eq!(two.sqrt_rounded(Up).0, 14143);
+        // sqrt(3) = 1.7320508...: the dropped part is above the half.
+        assert_eq!(Amount64::from(3).sqrt().0, 17321);
+        assert_eq!(Amount64::from(3).sqrt_rounded(Down).0, 17320);
+        // Negative input; checked_sqrt mirrors core's checked_isqrt.
+        assert_eq!(Amount64::from(-1).checked_sqrt_rounded(HalfUp), None);
+        assert_eq!(Amount64::from(-1).checked_sqrt(), None);
+        assert_eq!(
+            Amount64::from(2).checked_sqrt(),
+            Some(Amount64::from(2).sqrt())
+        );
+        // DIGITS = 19 holds only values below one, whose square root grows:
+        // near the top of the range it overflows, further down it works.
+        assert_eq!(Decimal::<19>(i64::MAX).checked_sqrt_rounded(HalfUp), None);
+        let quarter = Decimal::<19>(2_500_000_000_000_000_000); // 0.25
+        assert_eq!(
+            quarter.checked_sqrt_rounded(HalfUp),
+            Some(Decimal::<19>(5_000_000_000_000_000_000))
+        );
+
+        // Self-check against an independently rounded reference across
+        // random values and every mode.
+        let mut state = 0xC0FFEE123456789Fu64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        for i in 0..5000 {
+            // Sweep magnitudes from cents to the full i64 range.
+            let a = (next() >> (i % 64)) as i64 & i64::MAX;
+            let da = Decimal::<4>(a);
+            let n = a as u128 * 10_000;
+            let s = n.isqrt();
+            let rem = n - s * s;
+            for mode in [HalfUp, HalfDown, HalfEven, Down, Up] {
+                let want = s as i64
+                    + match mode {
+                        Down => 0,
+                        Up => (rem != 0) as i64,
+                        _ => (rem > s) as i64,
+                    };
+                assert_eq!(da.sqrt_rounded(mode).0, want, "sqrt {a} mode {mode:?}");
+            }
+            // The floor root squared never exceeds the value; one ulp more
+            // always does.
+            let f = da.sqrt_rounded(Down).0 as u128;
+            assert!(f * f <= n && (f + 1) * (f + 1) > n);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "argument of integer square root cannot be negative")]
+    fn test_sqrt_negative_panics() {
+        let _ = Amount64::from(-4).sqrt();
+    }
+
+    #[test]
+    fn test_mul_div_rounded() {
+        use crate::Rounding::*;
+        let total = Amount64::from(100);
+        // Pro-rata thirds; the exact product is rounded once.
+        assert_eq!(
+            total
+                .mul_div_rounded(Amount64::from(1), Amount64::from(3), HalfUp)
+                .0,
+            333_333
+        );
+        assert_eq!(
+            total
+                .mul_div_rounded(Amount64::from(2), Amount64::from(3), HalfUp)
+                .0,
+            666_667
+        );
+        // b and c may be 8-digit rates; their scale cancels.
+        let part = Rate64::from_str("0.12345678").unwrap();
+        let whole = Rate64::from_str("0.98765432").unwrap();
+        let got = total.mul_div_rounded(part, whole, HalfUp);
+        assert_eq!(got.0, 125_000); // 100 * 0.12499999886... = 12.5000
+        // c == ONE (mantissa 10^S) degenerates to the cross-scale multiply.
+        for mode in [HalfUp, HalfDown, HalfEven, Down, Up] {
+            assert_eq!(
+                total.mul_div_rounded(part, Rate64::ONE, mode),
+                total.mul_rounded(part, mode)
+            );
+        }
+        // Single rounding beats the two-step ratio round-trip: 1/3 as an
+        // 8-digit rate then times 3e10 accumulates the rate's error.
+        let big = Amount64::from(30_000_000_000i64);
+        let exact = big.mul_div_rounded(Amount64::from(1), Amount64::from(3), HalfUp);
+        assert_eq!(exact, Amount64::from(10_000_000_000i64));
+        let two_step = big.mul_rounded(
+            Amount64::from(1).div_rounded_to::<8>(Amount64::from(3), HalfUp),
+            HalfUp,
+        );
+        assert_ne!(exact, two_step);
+        // Overflow and zero-divisor surface through the checked variant.
+        assert_eq!(
+            Amount64::MAX.checked_mul_div_rounded(Amount64::from(2), Amount64::from(1), HalfUp),
+            None
+        );
+        assert_eq!(
+            total.checked_mul_div_rounded(Amount64::from(1), Amount64::ZERO, HalfUp),
+            None
+        );
+
+        // Random differential against a 256-bit-free i128 reference (inputs
+        // sized so the product fits i128 comfortably).
+        let mut state = 0xFEEDFACE8BADF00Du64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        for _ in 0..5000 {
+            let a = (next() as i64) >> 20;
+            let b = (next() as i64) >> 20;
+            let c = (next() as i64) >> 40;
+            if c == 0 {
+                continue;
+            }
+            let num = a as i128 * b as i128;
+            let q = num / c as i128;
+            let r = num % c as i128;
+            for mode in [HalfUp, HalfDown, HalfEven, Down, Up] {
+                let want = {
+                    let neg = (num < 0) != ((c as i128) < 0);
+                    let qa = q.unsigned_abs();
+                    let ra = r.unsigned_abs();
+                    let da = (c as i128).unsigned_abs();
+                    let up = match mode {
+                        Down => neg && ra != 0,
+                        Up => !neg && ra != 0,
+                        HalfUp => 2 * ra >= da,
+                        HalfDown => 2 * ra > da,
+                        HalfEven => 2 * ra > da || (2 * ra == da && qa & 1 == 1),
+                    };
+                    let m = qa + up as u128;
+                    // The symmetric range caps magnitudes at i64::MAX.
+                    if m >> 63 != 0 {
+                        None
+                    } else if neg {
+                        Some(-(m as i64))
+                    } else {
+                        Some(m as i64)
+                    }
+                };
+                assert_eq!(
+                    Decimal::<4>(a)
+                        .checked_mul_div_rounded(Decimal::<4>(b), Decimal::<4>(c), mode)
+                        .map(|v| v.0),
+                    want,
+                    "mul_div {a} * {b} / {c} mode {mode:?}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "ufmt")]

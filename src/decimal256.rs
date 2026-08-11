@@ -1183,7 +1183,7 @@ mod tests {
         assert_eq!(Amount256::from(f64::MIN), Amount256::MIN);
 
         // Wide but f64-exact value: 2^140.
-        let x = 1.3937965749081639e42f64;
+        let x = 1.393_796_574_908_164e42_f64;
         let v = Amount256::from_f64(x).unwrap();
         assert!((v.to_f64() - x).abs() / x < 1e-15);
 

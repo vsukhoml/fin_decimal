@@ -30,35 +30,29 @@ impl Rng {
     }
     /// A value with exactly `bits` significant bits (top bit set).
     fn bits(&mut self, bits: u32) -> u128 {
-        assert!(bits >= 1 && bits <= 127);
+        assert!((1..=127).contains(&bits));
         let top = 1u128 << (bits - 1);
         let mask = top - 1;
         top | (((self.next() as u128) << 64 | self.next() as u128) & mask)
     }
     /// An I256 magnitude with exactly `bits` significant bits.
     fn bits256(&mut self, bits: u32) -> I256 {
-        assert!(bits >= 1 && bits <= 254);
+        assert!((1..=254).contains(&bits));
         let mut bytes = [0u8; 32];
         for b in bytes.iter_mut().take((bits as usize).div_ceil(8)) {
             *b = self.next() as u8;
         }
-        let mut v = I256::from_le_bytes(bytes);
         // clear everything at and above `bits`, then set the top bit
-        let keep = |x: I256, bits: u32| {
-            let mut le = x.to_le_bytes();
-            for (i, b) in le.iter_mut().enumerate() {
-                let bit0 = 8 * i as u32;
-                if bit0 >= bits {
-                    *b = 0;
-                } else if bit0 + 8 > bits {
-                    *b &= (1u16 << (bits - bit0)) as u8 - 1;
-                }
+        for (i, b) in bytes.iter_mut().enumerate() {
+            let bit0 = 8 * i as u32;
+            if bit0 >= bits {
+                *b = 0;
+            } else if bit0 + 8 > bits {
+                *b &= (1u16 << (bits - bit0)) as u8 - 1;
             }
-            le[(bits as usize - 1) / 8] |= 1 << ((bits - 1) % 8);
-            I256::from_le_bytes(le)
-        };
-        v = keep(v, bits);
-        v
+        }
+        bytes[(bits as usize - 1) / 8] |= 1 << ((bits - 1) % 8);
+        I256::from_le_bytes(bytes)
     }
 }
 

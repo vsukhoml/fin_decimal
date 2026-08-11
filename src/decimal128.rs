@@ -1245,9 +1245,10 @@ mod tests {
         }
 
         // Extremes: i128::MIN on either side, and |a| < |b|.
+        let (min, three) = (i128::MIN, 3i128);
         assert_eq!(
-            (Decimal128::<4>(i128::MIN) % Decimal128::<4>(3)).0,
-            i128::MIN % 3
+            (Decimal128::<4>(min) % Decimal128::<4>(three)).0,
+            min % three
         );
         assert_eq!(
             (Decimal128::<4>(i128::MIN) % Decimal128::<4>(i128::MIN)).0,

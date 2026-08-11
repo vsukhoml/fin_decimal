@@ -781,87 +781,197 @@ pub(crate) const fn parse_decimal_mag_rounded<const W: usize>(
     scale: u8,
     mode: Rounding,
 ) -> Result<(bool, [u64; W]), AmountErrorKind> {
-    let src: &[u8] = src.as_bytes();
+    let bytes: &[u8] = src.as_bytes();
     let scale = scale as i64;
     debug_assert!(scale <= 19);
-    // `acc` holds all kept digits (integer digits plus at most `scale`
-    // fractional digits) as one magnitude; trailing zeros are appended at the
-    // end, so no separate integer part is needed.
+    // Kept digits are buffered in one word and folded into the wide `acc` once
+    // per `CHUNK_DIGITS`. That flush is where `Overflow` is *detected*, so 19
+    // is not adjustable: a shorter budget changes which error a string that
+    // both overflows and carries a stray byte returns ("35 digits then 'x'" is
+    // `InvalidDigit` at 19, `Overflow` at 16).
+    //
+    // 19 is also the **overflow licence** for the wrapping accumulation: the
+    // `chunk_len == CHUNK_DIGITS` branch below empties `chunk` on the 19th
+    // digit, so every `chunk * 10 + d` runs with `chunk_len < 19`, hence
+    // `chunk <= 10^18 - 1` and `chunk * 10 + 9 < 10^19 < u64::MAX`. The
+    // `debug_assert`s at the two accumulation sites restate that as code.
+    // Wrapping matters because the crate builds with `overflow-checks = true`:
+    // a checked mul+add puts two branches on the loop-carried `chunk` chain
+    // the next digit waits on, measured at ~15% of the whole parse.
+    const CHUNK_DIGITS: u32 = 19;
     let mut acc = [0u64; W];
-    // Kept digits are buffered 19 at a time in a single word, so the wide
-    // accumulator is touched once per 19 digits instead of once per digit.
     let mut chunk: u64 = 0;
     let mut chunk_len: u32 = 0;
-    let mut point: i64 = 0; // flag and counter for decimal point digits
-    let mut digit = false; // true if there was any digit
-    let mut round_digit: u64 = 0; // first fractional digit dropped beyond `scale`
-    let mut sticky = false; // any non-zero digit beyond `round_digit`
+    // Set at the flush site itself, never derived: the inline finish below is
+    // valid only while `acc` is still zero.
+    let mut flushed = false;
 
-    if src.is_empty() {
+    if bytes.is_empty() {
         return Err(AmountErrorKind::Empty);
     }
-
-    let (sign, digits): (bool, &[u8]) = match src[0] {
-        b'+' => (false, src.split_at(1).1),
-        b'-' => (true, src.split_at(1).1),
-        _ => (false, src),
+    let (sign, digits): (bool, &[u8]) = match bytes[0] {
+        b'+' => (false, bytes.split_at(1).1),
+        b'-' => (true, bytes.split_at(1).1),
+        _ => (false, bytes),
     };
-
+    let n = digits.len();
     let mut di = 0;
-    while di < digits.len() {
-        let s = digits[di];
-        di += 1;
-        match s {
-            b'.' if point > 0 => {
-                // should be just one decimal point
-                return Err(AmountErrorKind::InvalidDigit);
-            }
-            b'.' => point = 1,
-            c @ b'0'..=b'9' => {
-                digit = true;
-                let x = (c - b'0') as u64;
-                if point <= scale {
-                    chunk = chunk * 10 + x;
-                    chunk_len += 1;
-                    if chunk_len == 19 {
-                        if mul_add_word(&mut acc, upow10(19), chunk) {
-                            return Err(AmountErrorKind::Overflow);
-                        }
-                        chunk = 0;
-                        chunk_len = 0;
-                    }
-                } else if point == scale + 1 {
-                    // first digit beyond the resolution of the type
-                    round_digit = x;
-                } else if x != 0 {
-                    // any further non-zero digit sets the sticky flag
-                    sticky = true;
-                }
-                if point > 0 {
-                    point += 1; // count digits after the decimal point
-                }
-            }
-            _ => return Err(AmountErrorKind::InvalidDigit),
+
+    // Integer phase: always kept, never a round digit, never moves the
+    // fractional counter, so the body is pure accumulation. `wrapping_sub`
+    // classifies and converts in one compare and doubles as the terminator —
+    // the loop stops on the '.', on a stray byte and on end-of-input alike.
+    while di < n {
+        let d = digits[di].wrapping_sub(b'0');
+        if d > 9 {
+            break;
         }
+        debug_assert!(chunk_len < CHUNK_DIGITS);
+        chunk = chunk.wrapping_mul(10).wrapping_add(d as u64);
+        chunk_len += 1;
+        di += 1;
+        if chunk_len == CHUNK_DIGITS {
+            if mul_add_word(&mut acc, upow10(CHUNK_DIGITS), chunk) {
+                return Err(AmountErrorKind::Overflow);
+            }
+            chunk = 0;
+            chunk_len = 0;
+            flushed = true;
+        }
+    }
+    let int_digits = di;
+
+    // Terminator, then the fraction phase. `nfrac < scale` is the one test the
+    // seed's three (`point <= scale`, `point == scale + 1`, `point += 1`)
+    // collapse to: digits past it are dropped, and dropping them is the cold
+    // tail's business, which is what keeps the over-scale shape off a re-parse.
+    // The loop condition is tested *after* the flush, so a chunk that fills on
+    // the very digit that exhausts `scale` is flushed on that digit as the seed
+    // does — the flush reports `Overflow` ahead of any stray byte to come.
+    let mut nfrac: i64 = 0;
+    if di < n {
+        if digits[di] != b'.' {
+            return Err(AmountErrorKind::InvalidDigit);
+        }
+        di += 1;
+        while di < n && nfrac < scale {
+            let d = digits[di].wrapping_sub(b'0');
+            if d > 9 {
+                break;
+            }
+            debug_assert!(chunk_len < CHUNK_DIGITS);
+            chunk = chunk.wrapping_mul(10).wrapping_add(d as u64);
+            chunk_len += 1;
+            nfrac += 1;
+            di += 1;
+            if chunk_len == CHUNK_DIGITS {
+                if mul_add_word(&mut acc, upow10(CHUNK_DIGITS), chunk) {
+                    return Err(AmountErrorKind::Overflow);
+                }
+                chunk = 0;
+                chunk_len = 0;
+                flushed = true;
+            }
+        }
+    }
+
+    if di == n {
+        // Only at end of input, so `Empty` cannot pre-empt an `InvalidDigit`:
+        // a remaining byte is either a digit or an error already returned.
+        if int_digits == 0 && nfrac == 0 {
+            return Err(AmountErrorKind::Empty);
+        }
+        if !flushed {
+            // Nothing was dropped, so `nfrac <= scale`, the round digit is 0
+            // and every mode yields `round_up == false` — `mode` is dead here.
+            // `acc` is still zero, so the partial-chunk flush and the
+            // trailing-zero scaling collapse into one exact 128-bit multiply:
+            // `chunk < 10^19`, exponent at most 19, product below 10^38.
+            let wide = (chunk as u128) * (upow10((scale - nfrac) as u32) as u128);
+            let lo = wide as u64;
+            let hi = (wide >> 64) as u64;
+            if W == 1 && hi != 0 {
+                // Exactly where `mul_add_word` would have carried out.
+                return Err(AmountErrorKind::Overflow);
+            }
+            let out: &mut [u64] = &mut acc;
+            out[0] = lo;
+            if W > 1 {
+                out[1] = hi;
+            }
+            return Ok((sign, acc));
+        }
+    }
+    // `nfrac + 1` is the seed's `point`, including the value its
+    // `if point == 0 { point = 1 }` fixup lands on when no '.' was seen.
+    parse_tail(
+        sign,
+        digits,
+        di,
+        scale,
+        mode,
+        acc,
+        chunk,
+        chunk_len,
+        nfrac + 1,
+        int_digits != 0 || nfrac != 0,
+    )
+}
+
+/// Everything after the digit scan that a money-sized string never executes:
+/// the dropped-precision remainder, the partial-chunk flush, the trailing-zero
+/// scaling, and the one and only five-mode rounding decision.
+///
+/// `#[inline(never)]` is the point of the split — code that never runs still
+/// costs, by setting the hot path's register allocation, spill slots and branch
+/// layout. The line is drawn at the *end* of the scan rather than the front, so
+/// the scan's state is handed forward instead of thrown away and the input is
+/// never walked twice. Entered on two cold exits: `flushed`, or over-scale
+/// (`di < n`, fractional budget spent), where `point == scale + 1` makes the
+/// first remaining digit the round digit exactly as the seed's counter would.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)] // the scan state the split hands forward
+const fn parse_tail<const W: usize>(
+    sign: bool,
+    digits: &[u8],
+    mut di: usize,
+    scale: i64,
+    mode: Rounding,
+    mut acc: [u64; W],
+    chunk: u64,
+    chunk_len: u32,
+    mut point: i64,
+    mut digit: bool,
+) -> Result<(bool, [u64; W]), AmountErrorKind> {
+    let mut round_digit: u64 = 0; // first fractional digit dropped beyond `scale`
+    let mut sticky = false; // any non-zero digit beyond `round_digit`
+    while di < digits.len() {
+        let x = digits[di].wrapping_sub(b'0') as u64;
+        if x > 9 {
+            // A second '.' included: `point > 0` here, so the seed rejects it.
+            return Err(AmountErrorKind::InvalidDigit);
+        }
+        digit = true;
+        if point == scale + 1 {
+            round_digit = x;
+        } else if x != 0 {
+            sticky = true;
+        }
+        point += 1;
+        di += 1;
     }
     if !digit {
         return Err(AmountErrorKind::Empty);
     }
-    // Flush the partial chunk before scaling and rounding (the HalfEven
-    // parity below inspects the fully-accumulated magnitude).
+    // Flush the partial chunk before scaling and rounding (the HalfEven parity
+    // below inspects the fully-accumulated magnitude), then append zeros so the
+    // magnitude carries exactly `scale` fractional digits.
     if chunk_len > 0 && mul_add_word(&mut acc, upow10(chunk_len), chunk) {
         return Err(AmountErrorKind::Overflow);
     }
-
-    if point == 0 {
-        point = 1; // no decimal point is the same as a trailing one
-    }
-    // Append zeros so the magnitude carries exactly `scale` fractional digits
-    // (when the input had more than `scale` of them, nothing is missing).
     if point <= scale && mul_add_word(&mut acc, upow10((scale + 1 - point) as u32), 0) {
         return Err(AmountErrorKind::Overflow);
     }
-
     let round_up = match mode {
         Rounding::HalfUp => round_digit >= 5,
         Rounding::HalfDown => round_digit > 5 || (round_digit == 5 && sticky),
@@ -872,7 +982,6 @@ pub(crate) const fn parse_decimal_mag_rounded<const W: usize>(
     if round_up && mul_add_word(&mut acc, 1, 1) {
         return Err(AmountErrorKind::Overflow);
     }
-
     Ok((sign, acc))
 }
 
@@ -917,7 +1026,7 @@ pub(crate) fn str_mag<'a>(
         let is_zero_val = v == 0;
         // Trim trailing fractional zeros, then emit the remaining fraction.
         let mut fd = frac_digits;
-        while fd > 0 && v % 10 == 0 {
+        while fd > 0 && v.is_multiple_of(10) {
             v /= 10;
             fd -= 1;
         }
@@ -1324,6 +1433,295 @@ mod tests {
             parse_decimal_mag_rounded::<4>(&huge, 0, HalfUp),
             Err(AmountErrorKind::Overflow)
         );
+    }
+
+    /// The five-mode rounding decision, over every `(round digit, sticky,
+    /// parity)` the parser can see.
+    ///
+    /// The expectation is derived from the exact remainder — `2 * rem` against
+    /// the divisor, the crate's magnitude rounding rule — not from the parser's
+    /// own first-dropped-digit-plus-sticky formulation, so agreeing with it is
+    /// evidence rather than a restatement.
+    #[test]
+    fn test_parse_rounding_matrix() {
+        use crate::Rounding::*;
+        // `1.2{k}{r}{s}` at scale 2 keeps `12k` and drops the two-digit
+        // remainder `rs` out of a divisor of 100. `k` selects the parity of
+        // the kept magnitude, which is the only thing `HalfEven` adds.
+        for k in *b"45" {
+            let kept = 120 + (k - b'0') as u64;
+            for r in 0..10u8 {
+                for s in 0..2u8 {
+                    let rem = (r as u64) * 10 + s as u64;
+                    let src = [b'1', b'.', b'2', k, b'0' + r, b'0' + s];
+                    let src = core::str::from_utf8(&src).unwrap();
+                    let want = |up: bool| Ok((false, [kept + up as u64]));
+                    let got = |mode| parse_decimal_mag_rounded::<1>(src, 2, mode);
+                    assert_eq!(got(Down), want(false), "{src}");
+                    assert_eq!(got(Up), want(rem != 0), "{src}");
+                    assert_eq!(got(HalfUp), want(2 * rem >= 100), "{src}");
+                    assert_eq!(got(HalfDown), want(2 * rem > 100), "{src}");
+                    let even = 2 * rem > 100 || (2 * rem == 100 && kept % 2 == 1);
+                    assert_eq!(got(HalfEven), want(even), "{src}");
+                }
+            }
+        }
+    }
+
+    /// Rounding that carries out of the magnitude.
+    ///
+    /// The final `mul_add_word(&mut acc, 1, 1)` is the only overflow that
+    /// happens *after* every digit is accumulated: the digits are in range and
+    /// the increment is not, so the same string parses under `Down`.
+    #[test]
+    fn test_parse_round_carry_overflow() {
+        use crate::Rounding::{Down, HalfUp};
+        // 2^64 - 1 rounds up to 2^64: out of range at one limb, exact at two.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("18446744073709551615.5", 0, HalfUp),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<2>("18446744073709551615.5", 0, HalfUp),
+            Ok((false, [0, 1]))
+        );
+        // The value itself fits — only the carry does not.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("18446744073709551615.5", 0, Down),
+            Ok((false, [u64::MAX]))
+        );
+        // One less: the carry stops inside the limb.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("18446744073709551614.5", 0, HalfUp),
+            Ok((false, [u64::MAX]))
+        );
+        // Same boundary two and four limbs up.
+        assert_eq!(
+            parse_decimal_mag_rounded::<2>("340282366920938463463374607431768211455.5", 0, HalfUp),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<4>("340282366920938463463374607431768211455.5", 0, HalfUp),
+            Ok((false, [0, 0, 1, 0]))
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<4>(
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935.5",
+                0,
+                HalfUp
+            ),
+            Err(AmountErrorKind::Overflow)
+        );
+    }
+
+    /// Inputs with no integer digits at all.
+    ///
+    /// A leading '.' hands the cold tail a scan state in which nothing has
+    /// been seen yet, so "was there a digit" and "where is the round digit"
+    /// both have to survive the hand-off with the integer counter at zero.
+    #[test]
+    fn test_parse_no_integer_digits() {
+        use crate::Rounding::*;
+        let p = |s, scale, mode| parse_decimal_mag_rounded::<1>(s, scale, mode);
+        // Every mode against a bare half, with a kept magnitude of zero
+        // (even, so `HalfEven` goes down).
+        assert_eq!(p(".5", 0, HalfUp), Ok((false, [1])));
+        assert_eq!(p(".5", 0, HalfDown), Ok((false, [0])));
+        assert_eq!(p(".5", 0, HalfEven), Ok((false, [0])));
+        assert_eq!(p(".5", 0, Down), Ok((false, [0])));
+        assert_eq!(p(".5", 0, Up), Ok((false, [1])));
+        assert_eq!(p(".4", 0, HalfUp), Ok((false, [0])));
+        assert_eq!(p("-.5", 0, HalfUp), Ok((true, [1])));
+        // Over-scale, still with no integer digits.
+        assert_eq!(p(".00005", 4, HalfUp), Ok((false, [1])));
+        assert_eq!(p(".000049", 4, HalfUp), Ok((false, [0])));
+        assert_eq!(p(".00005", 4, HalfEven), Ok((false, [0])));
+        // Within scale: the same shape on the inline finish instead.
+        assert_eq!(p(".5", 4, HalfUp), Ok((false, [5000])));
+        assert_eq!(p("-.5", 4, HalfUp), Ok((true, [5000])));
+        // A point and nothing else is empty, not a zero.
+        assert_eq!(p(".", 4, HalfUp), Err(AmountErrorKind::Empty));
+        assert_eq!(p("-.", 4, HalfUp), Err(AmountErrorKind::Empty));
+        assert_eq!(p(".", 0, HalfUp), Err(AmountErrorKind::Empty));
+        // Strays reached through the fraction phase and through the tail.
+        assert_eq!(p(".x", 0, HalfUp), Err(AmountErrorKind::InvalidDigit));
+        assert_eq!(p(".x", 4, HalfUp), Err(AmountErrorKind::InvalidDigit));
+        assert_eq!(p(".5x", 0, HalfUp), Err(AmountErrorKind::InvalidDigit));
+        assert_eq!(p("..5", 4, HalfUp), Err(AmountErrorKind::InvalidDigit));
+        assert_eq!(p(".5.5", 4, HalfUp), Err(AmountErrorKind::InvalidDigit));
+    }
+
+    /// The 19-digit chunk boundary where it meets the scale boundary.
+    ///
+    /// The flush is where `Overflow` is detected, so its position relative to
+    /// the fractional budget is observable: a chunk that fills on the very
+    /// digit that exhausts `scale` must flush on that digit, ahead of any
+    /// stray byte still to come.
+    #[test]
+    fn test_parse_chunk_boundary() {
+        use crate::Rounding::HalfUp;
+        // 15 integer + 4 fractional digits: the chunk fills on the last
+        // fractional digit, which is also the one that exhausts `scale`.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("123456789012345.6789", 4, HalfUp),
+            Ok((false, [1234567890123456789]))
+        );
+        // Same string, stray byte after it: the value is in range, so the
+        // stray wins and the error is `InvalidDigit`.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("123456789012345.6789x", 4, HalfUp),
+            Err(AmountErrorKind::InvalidDigit)
+        );
+        // Digits past the boundary round against the already-flushed value.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("123456789012345.67891", 4, HalfUp),
+            Ok((false, [1234567890123456789]))
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("123456789012345.67895", 4, HalfUp),
+            Ok((false, [1234567890123456790]))
+        );
+        // 19 kept digits but fewer than `scale` fractional ones: the tail has
+        // to append the missing zeros to an accumulator that is not zero.
+        // One digit short of `scale` is the boundary of that padding —
+        // `point == scale` exactly, the only case a `<` there would drop.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("1234567890123456.789", 4, HalfUp),
+            Ok((false, [12345678901234567890]))
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<2>("12345678901234567.89", 4, HalfUp),
+            Ok((false, [12776324570088369204, 6]))
+        );
+        // 18 digits take the inline finish, 19 take the flush; both exact.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("999999999999999999", 0, HalfUp),
+            Ok((false, [999999999999999999]))
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("9999999999999999999", 0, HalfUp),
+            Ok((false, [9999999999999999999]))
+        );
+        // Leading zeros spend the digit budget without changing the value,
+        // so the flush path has to stay exact across them.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("00000000000000000000000001", 0, HalfUp),
+            Ok((false, [1]))
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("0.00000000000000000000000001", 4, HalfUp),
+            Ok((false, [0]))
+        );
+    }
+
+    /// The inline finish: one 128-bit product standing in for the partial-chunk
+    /// flush and the trailing-zero scaling, taken when nothing was flushed.
+    #[test]
+    fn test_parse_inline_finish_limits() {
+        use crate::Rounding::HalfUp;
+        // 18 kept digits scaled by 10^2, either side of 2^64: at one limb the
+        // high half of the product is the overflow test, at two it is limb 1.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("1844674407370955.16", 4, HalfUp),
+            Ok((false, [18446744073709551600]))
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("1844674407370955.17", 4, HalfUp),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<2>("1844674407370955.17", 4, HalfUp),
+            Ok((false, [84, 1]))
+        );
+        // The widest product the inline finish can form: 18 digits by 10^19,
+        // just under 10^38 — the bound that keeps it inside one u128.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("999999999999999999", 19, HalfUp),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<2>("999999999999999999", 19, HalfUp),
+            Ok((false, [8515484028849618944, 542101086242752216]))
+        );
+        // Zero at both ends of the scale range, and a signed zero.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("0", 0, HalfUp),
+            Ok((false, [0]))
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("0", 19, HalfUp),
+            Ok((false, [0]))
+        );
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("-0.0", 4, HalfUp),
+            Ok((true, [0]))
+        );
+        // A trailing point is a trailing zero.
+        assert_eq!(
+            parse_decimal_mag_rounded::<1>("7.", 4, HalfUp),
+            Ok((false, [70000]))
+        );
+    }
+
+    /// Randomised cross-check against an oracle that works on the whole digit
+    /// string at once: form the integer of every digit, divide by the power of
+    /// ten that places the point at `scale`, and round by comparing `2 * rem`
+    /// to the divisor. It shares no structure with the incremental scan, so it
+    /// covers digit placement, scaling and rounding together.
+    #[test]
+    fn test_parse_random_vs_exact_reference() {
+        use crate::Rounding::*;
+        let modes = [HalfUp, HalfDown, HalfEven, Down, Up];
+        let mut rng = Rng(0x0BADC0DE5EED1234);
+        for _ in 0..20000 {
+            // Up to 18 digits and scale up to 19 keeps the oracle's product
+            // (10^18 * 10^19) inside a u128.
+            let m = 1 + (rng.next() % 18) as usize;
+            let ip = (rng.next() % (m as u64 + 1)) as usize;
+            let scale = (rng.next() % 20) as u8;
+            let neg = rng.next() & 1 != 0;
+            let mode = modes[(rng.next() % 5) as usize];
+
+            let mut buf = [0u8; 24];
+            let mut len = 0;
+            if neg {
+                buf[len] = b'-';
+                len += 1;
+            }
+            let mut d: u128 = 0;
+            for i in 0..m {
+                if i == ip {
+                    buf[len] = b'.';
+                    len += 1;
+                }
+                let digit = (rng.next() % 10) as u8;
+                d = d * 10 + digit as u128;
+                buf[len] = b'0' + digit;
+                len += 1;
+            }
+            let src = core::str::from_utf8(&buf[..len]).unwrap();
+
+            let frac = (m - ip) as u32;
+            let (mag, rem, div) = if frac <= scale as u32 {
+                (d * upow10(scale as u32 - frac) as u128, 0u128, 1u128)
+            } else {
+                let div = upow10(frac - scale as u32) as u128;
+                (d / div, d % div, div)
+            };
+            let up = match mode {
+                Down => false,
+                Up => rem != 0,
+                HalfUp => 2 * rem >= div,
+                HalfDown => 2 * rem > div,
+                HalfEven => 2 * rem > div || (2 * rem == div && mag & 1 == 1),
+            };
+            let want = mag + up as u128;
+            assert_eq!(
+                parse_decimal_mag_rounded::<2>(src, scale, mode),
+                Ok((neg, [want as u64, (want >> 64) as u64])),
+                "{src} at scale {scale} with {mode:?}"
+            );
+        }
     }
 
     #[test]

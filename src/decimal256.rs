@@ -12,8 +12,8 @@ use crate::AmountSign;
 use crate::Rounding;
 use crate::limbs::{
     cmp_twice_rem_u64, dec_div, dec_mul, dec_mul_div, div_knuth, div_words_by_pow10,
-    div_words_by_word, mul_add_word, parse_decimal_mag_rounded, round_up_by_cmp, sig_limbs,
-    str_mag, upow10,
+    div_words_by_word, isqrt_words, mul_add_word, mul_words, parse_decimal_mag_rounded,
+    round_up_by_cmp, sig_limbs, str_mag, upow10,
 };
 use core::cmp::Ordering;
 use core::fmt;
@@ -722,6 +722,93 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
             Some(v) => Some(Decimal256::<DIGITS>(v)),
             None => unreachable!(),
         }
+    }
+
+    /// Square root with the given rounding mode: `None` for a negative
+    /// value. (Overflow is impossible: the root of even `MAX`'s scaled
+    /// mantissa stays below `2^160`.)
+    ///
+    /// The exact root of `self` is rounded once at the type's own scale:
+    /// the result is the correctly rounded decimal square root, computed as
+    /// the integer square root of `mantissa * 10^DIGITS`. For the half
+    /// modes a tie cannot occur (`(s + 1/2)^2` is never an integer), so
+    /// `HalfUp`, `HalfDown` and `HalfEven` always agree here.
+    ///
+    /// Not usable in const contexts (unlike the i64 backing's): the wide
+    /// core's Newton steps divide by a runtime divisor, which is where the
+    /// `asm` feature applies.
+    pub fn checked_sqrt_rounded(self, mode: Rounding) -> Option<Self> {
+        let (neg, mag) = self.0.to_sign_mag();
+        if neg {
+            return None;
+        }
+        let mut n = [0u64; 6];
+        mul_words(&mut n[..5], &mag, &[const { upow10(DIGITS as u32) }]);
+        let (root, rem_zero, rem_gt_root) = isqrt_words::<6, 3, 6>(&n);
+        let up = match mode {
+            Rounding::Down => false,
+            Rounding::Up => !rem_zero,
+            // Half modes, tie-free: round up iff n is past (s + 1/2)^2.
+            _ => rem_gt_root,
+        };
+        let mut mag_r = [root[0], root[1], root[2], 0];
+        if up {
+            mul_add_word(&mut mag_r, 1, 1);
+        }
+        match I256::from_sign_mag(false, mag_r) {
+            Some(v) => Some(Decimal256::<DIGITS>(v)),
+            // The root is below 2^160, far inside the range.
+            None => unreachable!(),
+        }
+    }
+
+    /// Square root, explicitly applying the given rounding mode. See
+    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded).
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount256, Rounding};
+    /// let two = Amount256::from(2);
+    /// assert_eq!(two.sqrt_rounded(Rounding::HalfUp), Amount256::from_str_const("1.4142"));
+    /// assert_eq!(two.sqrt_rounded(Rounding::Up), Amount256::from_str_const("1.4143"));
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if `self` is negative;
+    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded) is the
+    /// non-panicking form.
+    pub fn sqrt_rounded(self, mode: Rounding) -> Self {
+        match self.checked_sqrt_rounded(mode) {
+            Some(v) => v,
+            // None only for a negative input: the root cannot overflow.
+            None => panic!("argument of integer square root cannot be negative"),
+        }
+    }
+
+    /// Square root, rounded half-up at the type's own scale (the operators'
+    /// default rounding). See
+    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded).
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::Amount256;
+    /// assert_eq!(Amount256::from_str_const("2.25").sqrt(), Amount256::from_str_const("1.5"));
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if `self` is negative;
+    /// [`checked_sqrt`](Self::checked_sqrt) is the non-panicking form.
+    #[inline]
+    pub fn sqrt(self) -> Self {
+        self.sqrt_rounded(Rounding::HalfUp)
+    }
+
+    /// Checked form of [`sqrt`](Self::sqrt) (half-up rounding), mirroring
+    /// core's `checked_isqrt` on signed integers: `None` for a negative
+    /// value.
+    #[inline]
+    pub fn checked_sqrt(self) -> Option<Self> {
+        self.checked_sqrt_rounded(Rounding::HalfUp)
     }
 
     /// `self * b / c` on the exact 512-bit product with a single rounding at
@@ -1491,6 +1578,46 @@ mod tests {
     }
 
     #[test]
+    fn test_sqrt() {
+        use crate::Rounding::*;
+        // Exact squares round-trip; zero is exact.
+        let big = Amount256::from(10i128.pow(30));
+        assert_eq!((big * big).sqrt(), big);
+        assert_eq!(
+            Amount256::from_str_const("2.25").sqrt(),
+            Amount256::from_str_const("1.5")
+        );
+        assert_eq!(Amount256::ZERO.sqrt(), Amount256::ZERO);
+        // Rounding modes (tie-free: all half modes agree).
+        let two = Amount256::from(2);
+        assert_eq!(two.sqrt_rounded(Down), Amount256::from_str_const("1.4142"));
+        assert_eq!(
+            two.sqrt_rounded(HalfEven),
+            Amount256::from_str_const("1.4142")
+        );
+        assert_eq!(two.sqrt_rounded(Up), Amount256::from_str_const("1.4143"));
+        // MAX takes the widest (5-limb) Newton path; pinned against an
+        // independently computed root.
+        assert_eq!(
+            Amount256::MAX.sqrt(),
+            Amount256::from_str_const("2406159691680045115450337724776250569.2711")
+        );
+        assert_eq!(
+            Amount256::MAX.sqrt_rounded(Up),
+            Amount256::from_str_const("2406159691680045115450337724776250569.2712")
+        );
+        // Negative input.
+        assert_eq!(Amount256::from(-1).checked_sqrt(), None);
+        assert_eq!(Amount256::from(-1).checked_sqrt_rounded(HalfEven), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "argument of integer square root cannot be negative")]
+    fn test_sqrt_negative_panics() {
+        let _ = Amount256::from(-1).sqrt();
+    }
+
+    #[test]
     fn test_checked_rem_powi_recip_round_to() {
         use crate::Rounding::*;
         let a = Amount256::from_str_const("7.5");
@@ -1795,6 +1922,11 @@ mod tests {
                         da.checked_mul_div_rounded(da, db, mode).map(|v| v.0),
                         wa.checked_mul_div_rounded(wa, wb, mode).map(to128),
                         "mul_div ({a} * {a}) / {b}"
+                    );
+                    assert_eq!(
+                        da.abs().sqrt_rounded(mode).0,
+                        to128(wa.abs().sqrt_rounded(mode)),
+                        "sqrt |{a}|"
                     );
                 }
             }

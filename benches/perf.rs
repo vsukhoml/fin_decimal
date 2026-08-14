@@ -316,6 +316,18 @@ fn main() {
             let c = money[(i + 13) % PAIRS];
             a.mul_div_rounded(b, c, Rounding::HalfUp)
         });
+        let w128: Vec<Amount128> = (0..PAIRS)
+            .map(|_| Amount128::from_bits(rng.bits(120) as i128))
+            .collect();
+        let w256: Vec<Amount256> = (0..PAIRS)
+            .map(|_| Amount256::from_bits(rng.bits256(250)))
+            .collect();
+        bench("Amount128 sqrt_rounded (3-limb Newton)", |i| {
+            w128[i % PAIRS].sqrt_rounded(Rounding::HalfUp)
+        });
+        bench("Amount256 sqrt_rounded (5-limb Newton)", |i| {
+            w256[i % PAIRS].sqrt_rounded(Rounding::HalfUp)
+        });
     }
 
     // ---------------- string conversions ----------------

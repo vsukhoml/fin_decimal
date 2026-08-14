@@ -818,6 +818,176 @@ pub const fn isqrt_f64(n: u128) -> u64 {
     s as u64
 }
 
+/// Floor square root of any `u128` (unlike [`isqrt_f64`], the top bit may
+/// be set): single-limb inputs take core's `u64::isqrt` (native word
+/// divisions only), wider ones the division-free f64-seeded core, with
+/// inputs at or above `2^127` reduced by `isqrt(n) = 2 * isqrt(n / 4)`
+/// plus a one-step walk.
+fn isqrt_u128_any(n: u128) -> u64 {
+    if n >> 64 == 0 {
+        return (n as u64).isqrt();
+    }
+    let mut s = if n >> 127 == 0 {
+        isqrt_f64(n) as u128
+    } else {
+        (isqrt_f64(n >> 2) as u128) << 1
+    };
+    // The reduction loses at most one: walk to the exact floor. `s` stays
+    // below 2^64, so `s * s` and `(s + 1)^2` fit `u128`.
+    while s > 0 && s * s > n {
+        s -= 1;
+    }
+    while s < u64::MAX as u128 && (s + 1) * (s + 1) <= n {
+        s += 1;
+    }
+    s as u64
+}
+
+/// Floor square root of an `N`-limb magnitude, plus the remainder facts the
+/// decimal rounding needs: returns `(root, rem_zero, rem_gt_root)` with
+/// `root^2 <= n < (root + 1)^2`, `rem = n - root^2`, and `rem_gt_root` the
+/// tie-free half-mode test (`rem > root` means `n` is past
+/// `(root + 1/2)^2`; a half tie cannot occur since `(root + 1/2)^2` is
+/// never an integer).
+///
+/// `R` is the root width and `R2 == 2 * R >= N` (the root's square is
+/// formed in `R2` limbs). Two-limb inputs take the `u128` cores; wider
+/// ones an f64-seeded Newton iteration whose division steps run through
+/// [`div_knuth`] (so the `asm` feature applies and no 128-bit builtins are
+/// emitted).
+pub(crate) fn isqrt_words<const N: usize, const R: usize, const R2: usize>(
+    n: &[u64; N],
+) -> ([u64; R], bool, bool) {
+    debug_assert!(R2 == 2 * R && R2 >= N && N <= KNUTH_MAX_M && N >= 3);
+    let m = sig_limbs(n);
+    let mut root = [0u64; R];
+    if m <= 2 {
+        let v = (n[0] as u128) | ((n[1] as u128) << 64);
+        let s = isqrt_u128_any(v);
+        root[0] = s;
+        let rem = v - (s as u128) * (s as u128);
+        return (root, rem == 0, rem > s as u128);
+    }
+
+    // Seed from the top 127..=128 bits: r0 = isqrt(n >> e) << (e / 2) for an
+    // even `e` is a floor-accurate estimate with ~2^-63 relative error.
+    let bits = 64 * m - n[m - 1].leading_zeros() as usize;
+    let e = (bits - 128).next_multiple_of(2);
+    let (wo, bo) = (e / 64, e % 64);
+    let w = |i: usize| -> u128 { if i < N { n[i] as u128 } else { 0 } };
+    let t: u128 = if bo == 0 {
+        w(wo) | (w(wo + 1) << 64)
+    } else {
+        (w(wo) >> bo) | (w(wo + 1) << (64 - bo)) | (w(wo + 2) << (128 - bo))
+    };
+    let s0 = isqrt_u128_any(t);
+    let (hw, hb) = (e / 2 / 64, e / 2 % 64);
+    root[hw] = s0 << hb;
+    if hb != 0 {
+        root[hw + 1] = s0 >> (64 - hb);
+    }
+
+    // Two Newton (Heron) steps: root = (root + n / root) / 2. One step
+    // suffices for 3-limb inputs, the second pins 5-limb ones; running both
+    // unconditionally keeps the code uniform (the extra step is a no-op
+    // walk away from the fixed point). `n >= 2^128` makes `root >= 2^64`,
+    // so the divisor always has at least two significant limbs.
+    let mut i = 0;
+    while i < 2 {
+        // The true root is at least 2^64 (n >= 2^128 here); clamp an iterate
+        // that undershot below one limb so div_knuth always sees a two-limb
+        // divisor.
+        if sig_limbs(&root) < 2 {
+            root[0] = 0;
+            root[1] = 1;
+        }
+        let rl = sig_limbs(&root);
+        let mut q = [0u64; N];
+        let mut r = [0u64; R];
+        div_knuth(&mut q[..m - rl + 1], &mut r[..rl], &n[..m], &root[..rl]);
+        // sum = root + q, then halve. The sum fits N limbs: both terms are
+        // within a hair of the true root (< 2^(64R - 1)).
+        let mut carry: u128 = 0;
+        let mut sum = [0u64; N];
+        let mut j = 0;
+        while j < N {
+            let s = q[j] as u128 + if j < R { root[j] as u128 } else { 0 } + carry;
+            sum[j] = s as u64;
+            carry = s >> 64;
+            j += 1;
+        }
+        debug_assert!(carry == 0);
+        let mut j = 0;
+        while j < N {
+            let lo = sum[j] >> 1;
+            let hi = if j + 1 < N { sum[j + 1] << 63 } else { 0 };
+            sum[j] = lo | hi;
+            j += 1;
+        }
+        debug_assert!(is_zero(&sum[R..]));
+        root.copy_from_slice(&sum[..R]);
+        i += 1;
+    }
+
+    // Walk to the exact floor (the Newton iterate is within a couple of
+    // ulps), then extract the remainder facts.
+    let mut n_pad = [0u64; R2];
+    n_pad[..N].copy_from_slice(n);
+    let mut sq = [0u64; R2];
+    loop {
+        mul_words(&mut sq, &root, &root);
+        if cmp_words(&sq, &n_pad) == Ordering::Greater {
+            // root -= 1
+            let mut j = 0;
+            while j < R {
+                let (v, borrow) = root[j].overflowing_sub(1);
+                root[j] = v;
+                if !borrow {
+                    break;
+                }
+                j += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    loop {
+        let mut r1 = root;
+        if mul_add_word(&mut r1, 1, 1) {
+            break; // root + 1 does not fit R limbs, so its square exceeds n
+        }
+        mul_words(&mut sq, &r1, &r1);
+        if cmp_words(&sq, &n_pad) == Ordering::Greater {
+            break;
+        }
+        root = r1;
+    }
+
+    // rem = n - root^2 (fits R2 limbs, non-negative by construction).
+    mul_words(&mut sq, &root, &root);
+    let mut rem = [0u64; R2];
+    let mut borrow: u128 = 0;
+    let mut j = 0;
+    while j < R2 {
+        let d = n_pad[j] as u128;
+        let s = sq[j] as u128 + borrow;
+        if d >= s {
+            rem[j] = (d - s) as u64;
+            borrow = 0;
+        } else {
+            rem[j] = ((d + (1u128 << 64)) - s) as u64;
+            borrow = 1;
+        }
+        j += 1;
+    }
+    debug_assert!(borrow == 0);
+    let rem_zero = is_zero(&rem);
+    let mut root_pad = [0u64; R2];
+    root_pad[..R].copy_from_slice(&root);
+    let rem_gt_root = cmp_words(&rem, &root_pad) == Ordering::Greater;
+    (root, rem_zero, rem_gt_root)
+}
+
 /// Floor square root of a `u128` by pure integer Newton (Heron) iteration:
 /// the seed `2^ceil(bits/2)` overshoots `sqrt(n)`, and each step
 /// `x = (x + n/x) / 2` runs `n / x` through [`div_words_by_word`] (so the
@@ -1699,6 +1869,85 @@ mod tests {
     /// in any of them fails deterministically (the adversarial test reaches
     /// the same paths, but through a PRNG). Vectors were mined from the
     /// adversarial search; each is asserted to still hit its path.
+    #[test]
+    fn test_isqrt_words_self_check() {
+        // The floor-root property is self-verifying: root^2 <= n <
+        // (root+1)^2, rem flags consistent with n - root^2. Random shapes
+        // across both instantiations, biased toward boundary limb patterns.
+        fn check<const N: usize, const R: usize, const R2: usize>(n: &[u64; N]) {
+            let (root, rem_zero, rem_gt) = isqrt_words::<N, R, R2>(n);
+            let mut n_pad = [0u64; R2];
+            n_pad[..N].copy_from_slice(n);
+            let mut sq = [0u64; R2];
+            mul_words(&mut sq, &root, &root);
+            assert_ne!(cmp_words(&sq, &n_pad), Ordering::Greater, "root^2 > n");
+            // (root + 1)^2 > n, unless root + 1 overflows R limbs.
+            let mut r1 = root;
+            if !mul_add_word(&mut r1, 1, 1) {
+                mul_words(&mut sq, &r1, &r1);
+                assert_eq!(cmp_words(&sq, &n_pad), Ordering::Greater, "(root+1)^2 <= n");
+            }
+            // rem facts.
+            mul_words(&mut sq, &root, &root);
+            let mut rem = [0u64; R2];
+            let mut borrow: i128 = 0;
+            for j in 0..R2 {
+                let d = n_pad[j] as i128 - sq[j] as i128 - borrow;
+                rem[j] = d as u64;
+                borrow = (d < 0) as i128;
+            }
+            assert_eq!(borrow, 0);
+            assert_eq!(rem_zero, is_zero(&rem), "rem_zero");
+            let mut rp = [0u64; R2];
+            rp[..R].copy_from_slice(&root);
+            assert_eq!(
+                rem_gt,
+                cmp_words(&rem, &rp) == Ordering::Greater,
+                "rem_gt_root"
+            );
+        }
+
+        let mut rng = Rng(0x15C4A57B00B5);
+        for iter in 0..20000 {
+            let mut n4 = [0u64; 4];
+            let mut n6 = [0u64; 6];
+            // Vary significant width, including 1..2-limb (u128 tier), the
+            // >= 2^127 two-limb corner, and full-width values.
+            let w4 = 1 + (rng.next() as usize) % 3; // callers cap at 3 limbs
+            let w6 = 1 + (rng.next() as usize) % 5; // callers cap at 5 limbs
+            for x in n4.iter_mut().take(w4) {
+                *x = rng.next();
+            }
+            for x in n6.iter_mut().take(w6) {
+                *x = rng.next();
+            }
+            match iter % 4 {
+                0 => {
+                    n4[w4 - 1] |= 1 << 63; // saturate the top bit
+                    n6[w6 - 1] |= 1 << 63;
+                }
+                1 => {
+                    n4[w4 - 1] = 1; // barely into the next limb
+                    n6[w6 - 1] = 1;
+                }
+                2 => {
+                    // Perfect squares (and their neighbors on iter % 8).
+                    let s = rng.next() as u128;
+                    let sq = s * s;
+                    n4 = [sq as u64, (sq >> 64) as u64, 0, 0];
+                    n6 = [sq as u64, (sq >> 64) as u64, 0, 0, 0, 0];
+                    if iter % 8 == 6 {
+                        n4[0] = n4[0].wrapping_add(1);
+                        n6[0] = n6[0].wrapping_add(1);
+                    }
+                }
+                _ => {}
+            }
+            check::<4, 2, 4>(&n4);
+            check::<6, 3, 6>(&n6);
+        }
+    }
+
     #[test]
     fn test_div_knuth_hard_path_fixtures() {
         // Add-back (D6) with an already-normalized divisor (s == 0).

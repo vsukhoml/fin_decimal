@@ -58,6 +58,18 @@ pub fn probe_amount64_sqrt(a: Amount64) -> Amount64 {
     a.sqrt_rounded(Rounding::HalfUp)
 }
 
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount128_sqrt(a: Amount128) -> Amount128 {
+    a.sqrt_rounded(Rounding::HalfUp)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount256_sqrt(a: Amount256) -> Amount256 {
+    a.sqrt_rounded(Rounding::HalfUp)
+}
+
 // ---- rounding: divide/multiply by constant 10^4, must be division-free ----
 
 #[unsafe(no_mangle)]
@@ -179,6 +191,8 @@ fn main() {
         black_box(probe_amount128_div_int(a128, black_box(10007)))
     );
     println!("{}", black_box(probe_amount64_sqrt(a64)));
+    println!("{}", black_box(probe_amount128_sqrt(a128)));
+    println!("{}", black_box(probe_amount256_sqrt(a256)));
     println!("{}", black_box(probe_amount64_mul_div(a64, b64, b64)));
     println!("{}", black_box(probe_amount128_mul_div(a128, b128, b128)));
     println!("{}", black_box(probe_amount256_mul_div(a256, b256, b256)));

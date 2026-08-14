@@ -77,7 +77,8 @@ done
 for fn in probe_amount64_div probe_amount128_div probe_amount256_div \
           probe_amount128_rem probe_amount64_ratio probe_amount128_div_int \
           probe_amount64_mul_div probe_amount128_mul_div \
-          probe_amount256_mul_div probe_amount64_sqrt; do
+          probe_amount256_mul_div probe_amount64_sqrt \
+          probe_amount128_sqrt probe_amount256_sqrt; do
     b=$(body "$fn")
     if [ -z "$b" ]; then
         report "$fn" "FAIL" "function not found in assembly"

@@ -905,16 +905,18 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// use fin_decimal::Amount64;
     /// let f = Amount64::from_f64(3.01_f64).unwrap();
     /// let g = Amount64::from_f64(4.0_f64).unwrap();
+    /// let h = Amount64::from_f64(-3.7_f64).unwrap();
     ///
     /// assert_eq!(f.ceil(), 4);
     /// assert_eq!(g.ceil(), 4);
+    /// assert_eq!(h.ceil(), -3);
     /// ```
     pub fn ceil(self) -> Self {
         let mut frac = self.0 % Self::SCALE_INT;
         if frac != 0 {
-            if self.0 < 0 {
-                frac += Self::SCALE_INT
-            } else {
+            // For negatives, ceiling is truncation: dropping the (negative)
+            // fraction already moves toward +inf.
+            if self.0 > 0 {
                 frac -= Self::SCALE_INT
             }
             Decimal::<DIGITS>(self.0 - frac)
@@ -1589,7 +1591,7 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// ```
     #[inline]
     pub fn from_le_bytes(bytes: [u8; mem::size_of::<i64>()]) -> Self {
-        Self::from_bits(u64::from_ne_bytes(bytes))
+        Self::from_bits(u64::from_le_bytes(bytes))
     }
 
     /// Raises a number to an integer power.
@@ -1712,7 +1714,7 @@ impl<const DIGITS: u8> PartialEq<Decimal<DIGITS>> for i64 {
 impl<const DIGITS: u8> PartialEq<Decimal<DIGITS>> for f64 {
     #[inline]
     fn eq(&self, other: &Decimal<DIGITS>) -> bool {
-        *self * Amount64::SCALE_F64 == other.0 as f64
+        *self * Decimal::<DIGITS>::SCALE_F64 == other.0 as f64
     }
 }
 
@@ -2537,6 +2539,28 @@ mod tests {
             Amount64::from_str_rounded("1.00005", Rounding::HalfEven),
             Ok(Decimal::<4>(10000))
         );
+
+        // Const-evaluable accessors and conversions (CTFE runs with overflow
+        // checks always on); the runtime asserts pin the same values.
+        const N: Amount64 = Amount64::from_str_const("2.5");
+        const ABS: Amount64 = Amount64::from_str_const("-2.5").abs();
+        const FRACT: Amount64 = N.fract();
+        const BITS: u64 = N.to_bits();
+        const FROM_BITS: Amount64 = Amount64::from_bits(25_000);
+        const SUM: Option<Amount64> = N.checked_add(N);
+        const FROM_INT: Result<Amount64, AmountErrorKind> = Amount64::from_i64(2);
+        const PARTS: Result<Amount64, AmountErrorKind> =
+            Amount64::from_decimal_parts_rounded(25, -1, Rounding::HalfUp);
+        const INT: i64 = N.to_i64();
+        assert_eq!(N, Decimal::<4>(25_000));
+        assert_eq!(ABS, N);
+        assert_eq!(FRACT, Decimal::<4>(5000));
+        assert_eq!(BITS, 25_000);
+        assert_eq!(FROM_BITS, N);
+        assert_eq!(SUM, Some(Amount64::from(5)));
+        assert_eq!(FROM_INT, Ok(Amount64::from(2)));
+        assert_eq!(PARTS, Ok(N));
+        assert_eq!(INT, 2);
     }
 
     #[test]
@@ -2876,6 +2900,561 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_error_kind_accessors() {
+        // kind() returns the variant itself.
+        assert_eq!(AmountErrorKind::Empty.kind(), &AmountErrorKind::Empty);
+        assert_eq!(AmountErrorKind::Inexact.kind(), &AmountErrorKind::Inexact);
+        // Display goes through __description for every variant.
+        assert_eq!(
+            format!("{}", AmountErrorKind::Empty),
+            "cannot parse integer from empty string"
+        );
+        assert_eq!(
+            format!("{}", AmountErrorKind::InvalidDigit),
+            "invalid symbol found in string"
+        );
+        assert_eq!(
+            format!("{}", AmountErrorKind::Overflow),
+            "number too large to fit in target type"
+        );
+        assert_eq!(
+            format!("{}", AmountErrorKind::Inexact),
+            "value cannot be represented exactly at the target scale"
+        );
+    }
+
+    #[test]
+    fn test_parse_decimal_i64_default() {
+        use crate::parse_decimal_i64;
+        // The non-rounded wrapper delegates with HalfUp.
+        assert_eq!(parse_decimal_i64("1.23455", 4), Ok(12346));
+        assert_eq!(parse_decimal_i64("-1.23455", 4), Ok(-12346));
+        assert_eq!(parse_decimal_i64("1.5", 8), Ok(150_000_000));
+        assert_eq!(
+            parse_decimal_i64("bad", 4),
+            Err(AmountErrorKind::InvalidDigit)
+        );
+    }
+
+    #[test]
+    fn test_new_and_conversions() {
+        // new() is zero.
+        assert_eq!(Amount64::new(), Amount64::ZERO);
+        assert_eq!(Amount64::new().0, 0);
+
+        // from_i64: in-range scales up exactly, out-of-range overflows.
+        assert_eq!(Amount64::from_i64(3), Ok(Decimal::<4>(30000)));
+        assert_eq!(Amount64::from_i64(-3), Ok(Decimal::<4>(-30000)));
+        assert_eq!(
+            Amount64::from_i64(Amount64::INT_MAX),
+            Ok(Decimal::<4>(Amount64::INT_MAX * Amount64::SCALE_INT))
+        );
+        assert_eq!(
+            Amount64::from_i64(Amount64::INT_MAX + 1),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(
+            Amount64::from_i64(Amount64::INT_MIN - 1),
+            Err(AmountErrorKind::Overflow)
+        );
+
+        // to_i64 truncates toward zero.
+        assert_eq!(Decimal::<4>(19999).to_i64(), 1);
+        assert_eq!(Decimal::<4>(-19999).to_i64(), -1);
+        assert_eq!(Decimal::<4>(0).to_i64(), 0);
+
+        // to_f64 divides by the scale (exact for these values).
+        assert_eq!(Decimal::<4>(15000).to_f64(), 1.5);
+        assert_eq!(Decimal::<4>(-15000).to_f64(), -1.5);
+
+        // from_f64 rejects out-of-range values; from_f32 delegates.
+        assert_eq!(Amount64::from_f64(1e30), Err(AmountErrorKind::Overflow));
+        assert_eq!(Amount64::from_f64(-1e30), Err(AmountErrorKind::Overflow));
+        assert_eq!(Amount64::from_f32(1.5), Ok(Decimal::<4>(15000)));
+        assert_eq!(Amount64::from_f32(1e30), Err(AmountErrorKind::Overflow));
+    }
+
+    #[test]
+    fn test_from_decimal_parts_rounded_scale_up() {
+        use crate::Rounding::*;
+        // Zero mantissa short-circuits at any exponent.
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(0, 1000, HalfUp),
+            Ok(Decimal::<4>(0))
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(0, -1000, Down),
+            Ok(Decimal::<4>(0))
+        );
+        // Scale up is exact regardless of mode.
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(5, 2, Down),
+            Ok(Decimal::<4>(5_000_000))
+        );
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(123, -2, HalfUp),
+            Ok(Decimal::<4>(12300))
+        );
+        // The power of ten itself overflows i128.
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(1, 1000, HalfUp),
+            Err(AmountErrorKind::Overflow)
+        );
+        // Scaled value fits i128 but not the i64 backing.
+        assert_eq!(
+            Amount64::from_decimal_parts_rounded(i64::MAX as i128 + 1, -4, HalfUp),
+            Err(AmountErrorKind::Overflow)
+        );
+    }
+
+    #[test]
+    fn test_from_str_const_runtime() {
+        // The runtime path matches FromStr with HalfUp.
+        assert_eq!(Amount64::from_str_const("19.99").0, 199_900);
+        assert_eq!(Amount64::from_str_const("-1.00005").0, -10001);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid decimal literal")]
+    fn test_from_str_const_invalid_panics() {
+        let _ = Amount64::from_str_const("not a number");
+    }
+
+    #[test]
+    fn test_from_str_ref() {
+        // From<&str> parses like FromStr (HalfUp).
+        assert_eq!(Amount64::from("1.5"), Decimal::<4>(15000));
+        assert_eq!(Amount64::from("-0.0001"), Decimal::<4>(-1));
+        assert_eq!(Amount64::from("1.00005"), Decimal::<4>(10001));
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidDigit")]
+    fn test_from_str_ref_invalid_panics() {
+        let _ = Amount64::from("bogus");
+    }
+
+    #[test]
+    fn test_abs_signum_predicates() {
+        assert_eq!(Decimal::<4>(-12345).abs(), Decimal::<4>(12345));
+        assert_eq!(Decimal::<4>(12345).abs(), Decimal::<4>(12345));
+        assert_eq!(Amount64::ZERO.abs(), Amount64::ZERO);
+
+        assert!(Amount64::from(10).is_positive());
+        assert!(!Amount64::ZERO.is_positive());
+        assert!(!Amount64::from(-10).is_positive());
+        assert!(Amount64::from(-10).is_negative());
+        assert!(!Amount64::ZERO.is_negative());
+        assert!(!Amount64::from(10).is_negative());
+
+        assert_eq!(Amount64::from(10).signum(), Amount64::ONE);
+        assert_eq!(Amount64::from(-10).signum(), Amount64::MINUS_ONE);
+        assert_eq!(Amount64::ZERO.signum(), Amount64::ZERO);
+    }
+
+    #[test]
+    fn test_checked_add_sub_edges() {
+        // Success arm of checked_add.
+        assert_eq!(
+            Amount64::from(1).checked_add(Amount64::from(2)),
+            Some(Amount64::from(3))
+        );
+        // Overflow arms on both sides of zero.
+        assert_eq!(Amount64::MIN.checked_sub(Amount64::from(1)), None);
+        assert_eq!(Amount64::from(-1).checked_add(Amount64::MIN), None);
+    }
+
+    #[test]
+    fn test_ceil() {
+        assert_eq!(Decimal::<4>(10000).ceil(), Decimal::<4>(10000));
+        assert_eq!(Decimal::<4>(10001).ceil(), Decimal::<4>(20000));
+        assert_eq!(Decimal::<4>(19999).ceil(), Decimal::<4>(20000));
+        assert_eq!(Decimal::<4>(0).ceil(), Decimal::<4>(0));
+
+        // Exact negatives pass through unchanged.
+        assert_eq!(Decimal::<4>(-10000).ceil(), Decimal::<4>(-10000));
+        // Negative non-integers truncate toward +inf (mathematical ceiling).
+        assert_eq!(Decimal::<4>(-10001).ceil(), Decimal::<4>(-10000));
+        assert_eq!(Decimal::<4>(-19999).ceil(), Decimal::<4>(-10000));
+        assert_eq!(Decimal::<4>(-9999).ceil(), Decimal::<4>(0));
+        // ceil(x) == -floor(-x)
+        for m in [-19999i64, -10001, -9999, 0, 9999, 10001, 19999] {
+            assert_eq!(Decimal::<4>(m).ceil(), -Decimal::<4>(-m).floor(), "{m}");
+        }
+    }
+
+    #[test]
+    fn test_f64_eq_uses_type_scale() {
+        // Regression: `f64 == Decimal<DIGITS>` once hardcoded Amount64's
+        // scale, so it was wrong for any other DIGITS.
+        assert!(0.5f64 == Rate64::from_str_const("0.5"));
+        assert!(0.5f64 != Rate64::from_str_const("0.00005"));
+        assert!(2.0f64 == Decimal::<0>::from(2));
+        assert!(0.5f64 == Amount64::from_str_const("0.5"));
+    }
+
+    #[test]
+    fn test_round_to_halfeven_negative_ties() {
+        use crate::Rounding::HalfEven;
+        // -1.5: integer part -1 is odd -> rounds away to -2.
+        assert_eq!(
+            Decimal::<4>(-15000).round_to(HalfEven),
+            Decimal::<4>(-20000)
+        );
+        // -2.5: integer part -2 is even -> stays -2.
+        assert_eq!(
+            Decimal::<4>(-25000).round_to(HalfEven),
+            Decimal::<4>(-20000)
+        );
+        // Below/above the negative half round directionally.
+        assert_eq!(
+            Decimal::<4>(-16000).round_to(HalfEven),
+            Decimal::<4>(-20000)
+        );
+        assert_eq!(
+            Decimal::<4>(-14000).round_to(HalfEven),
+            Decimal::<4>(-10000)
+        );
+    }
+
+    #[test]
+    fn test_fract() {
+        assert_eq!(Decimal::<4>(36000).fract(), Decimal::<4>(6000));
+        assert_eq!(Decimal::<4>(-36000).fract(), Decimal::<4>(-6000));
+        assert_eq!(Decimal::<4>(30000).fract(), Decimal::<4>(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to multiply with overflow")]
+    fn test_mul_overflow_panics() {
+        let _ = Amount64::MAX * Amount64::from(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide with overflow")]
+    fn test_div_overflow_panics() {
+        let _ = Amount64::MAX / Amount64::from_str_const("0.0001");
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to compute square root with overflow")]
+    fn test_sqrt_overflow_panics() {
+        // At DIGITS = 19 every value is below one, so the root grows and
+        // overflows near the top of the range.
+        let _ = Decimal::<19>(i64::MAX).sqrt();
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_mul_div_rounded_by_zero_panics() {
+        let _ =
+            Amount64::from(1).mul_div_rounded(Amount64::from(1), Amount64::ZERO, Rounding::HalfUp);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to multiply with overflow")]
+    fn test_mul_div_rounded_overflow_panics() {
+        let _ =
+            Amount64::MAX.mul_div_rounded(Amount64::from(2), Amount64::from(1), Rounding::HalfUp);
+    }
+
+    #[test]
+    fn test_bits_and_bytes() {
+        let n = Amount64::from_bits(0x1234567890123456u64);
+        assert_eq!(n.0, 0x1234567890123456i64);
+        assert_eq!(n.to_bits(), 0x1234567890123456u64);
+        // Negative values round-trip through the u64 bit pattern.
+        assert_eq!(
+            Amount64::from_bits(Decimal::<4>(-1).to_bits()),
+            Decimal::<4>(-1)
+        );
+
+        assert_eq!(n.swap_bytes().to_bits(), 0x5634129078563412u64);
+        assert_eq!(n.swap_bytes().swap_bytes(), n);
+
+        let be = [0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56];
+        let le = [0x56, 0x34, 0x12, 0x90, 0x78, 0x56, 0x34, 0x12];
+        assert_eq!(n.to_be_bytes(), be);
+        assert_eq!(n.to_le_bytes(), le);
+        assert_eq!(Amount64::from_be_bytes(be), n);
+        assert_eq!(Amount64::from_le_bytes(le), n);
+        // Native order matches the platform's endianness and round-trips.
+        let ne = n.to_ne_bytes();
+        assert_eq!(ne, if cfg!(target_endian = "big") { be } else { le });
+        assert_eq!(Amount64::from_ne_bytes(ne), n);
+    }
+
+    #[test]
+    fn test_clamp_min_max() {
+        let lo = Amount64::MINUS_ONE;
+        let hi = Amount64::ONE;
+        assert_eq!(Amount64::from(2).clamp(lo, hi), hi);
+        assert_eq!(Amount64::from(-2).clamp(lo, hi), lo);
+        assert_eq!(Amount64::ZERO.clamp(lo, hi), Amount64::ZERO);
+
+        assert_eq!(hi.min(lo), lo);
+        assert_eq!(lo.min(hi), lo);
+        assert_eq!(hi.max(lo), hi);
+        assert_eq!(lo.max(hi), hi);
+        let a = Amount64::from(3);
+        assert_eq!(a.min(a), a);
+        assert_eq!(a.max(a), a);
+    }
+
+    #[test]
+    fn test_mixed_comparisons() {
+        let a = Amount64::from(2);
+        // Decimal vs i64, both directions.
+        assert!(a > 1i64);
+        assert!(a < 3i64);
+        assert!(a == 2i64);
+        assert!(1i64 < a);
+        assert!(3i64 > a);
+        assert!(2i64 == a);
+        assert!(2i64 != Amount64::from_str_const("2.5"));
+        // Decimal vs f64, both directions; fractions participate exactly.
+        assert!(a > 1.5f64);
+        assert!(a < 2.5f64);
+        assert!(a == 2.0f64);
+        assert!(2.0f64 == a);
+        assert!(2.5f64 != a);
+        assert!(Amount64::from_str_const("2.5") == 2.5f64);
+    }
+
+    #[test]
+    fn test_from_saturating_and_f32() {
+        // From<f64> saturates out-of-range values instead of erroring.
+        assert_eq!(Amount64::from(1e30f64), Amount64::MAX);
+        assert_eq!(Amount64::from(-1e30f64), Amount64::MIN);
+        // In-range f32/f64 conversions scale exactly.
+        assert_eq!(Amount64::from(1.5f32), Decimal::<4>(15000));
+        assert_eq!(Amount64::from(-2.25f32), Decimal::<4>(-22500));
+        // From<i32>.
+        assert_eq!(Amount64::from(3i32), Decimal::<4>(30000));
+        assert_eq!(Amount64::from(-3i32), Decimal::<4>(-30000));
+    }
+
+    #[test]
+    fn test_mixed_arithmetic_ops() {
+        let a = Amount64::from(2);
+        // Decimal (+|-) primitive scales the primitive up.
+        assert_eq!(a + 3i64, Amount64::from(5));
+        assert_eq!(a + 3i32, Amount64::from(5));
+        assert_eq!(a + 0.5f64, Amount64::from_str_const("2.5"));
+        assert_eq!(a - 3i64, Amount64::from(-1));
+        assert_eq!(a - 1i32, Amount64::from(1));
+        assert_eq!(a - 0.5f64, Amount64::from_str_const("1.5"));
+
+        // i64 (+|-) Decimal rounds the decimal half-away-from-zero first.
+        assert_eq!(10i64 + Amount64::from_str_const("2.5"), 13);
+        assert_eq!(10i64 + Amount64::from_str_const("2.4999"), 12);
+        assert_eq!(10i64 + Amount64::from_str_const("-2.5"), 7);
+        assert_eq!(10i64 - Amount64::from_str_const("2.5"), 7);
+        assert_eq!(10i64 - Amount64::from_str_const("2.4999"), 8);
+        assert_eq!(10i64 - Amount64::from_str_const("-2.5"), 13);
+
+        // f64 (+|-) Decimal go through to_f64 (exact for these values).
+        assert_eq!(1.5f64 + Amount64::from_str_const("2.25"), 3.75f64);
+        assert_eq!(10.0f64 - Amount64::from_str_const("2.5"), 7.5f64);
+
+        // Multiplying by integers scales the raw value directly.
+        assert_eq!(a * 3i64, Amount64::from(6));
+        assert_eq!(a * 3i32, Amount64::from(6));
+        // i64 * Decimal treats the i64 as a raw mantissa and returns one.
+        assert_eq!(20000i64 * Amount64::from(3), 60000i64);
+    }
+
+    #[test]
+    fn test_assign_ops() {
+        let mut a = Amount64::from(10);
+        a += Amount64::from(2);
+        assert_eq!(a, Amount64::from(12));
+        a -= Amount64::from(4);
+        assert_eq!(a, Amount64::from(8));
+        a *= Amount64::from(2);
+        assert_eq!(a, Amount64::from(16));
+        a /= Amount64::from(4);
+        assert_eq!(a, Amount64::from(4));
+        a %= Amount64::from_str_const("2.5");
+        assert_eq!(a, Amount64::from_str_const("1.5"));
+    }
+
+    #[test]
+    fn test_sum_product_iters() {
+        let vals = [Amount64::from(1), Amount64::from(2), Amount64::from(3)];
+        // By-value and by-reference Sum.
+        assert_eq!(vals.iter().copied().sum::<Amount64>(), Amount64::from(6));
+        assert_eq!(vals.iter().sum::<Amount64>(), Amount64::from(6));
+        // By-value and by-reference Product.
+        assert_eq!(
+            vals.iter().copied().product::<Amount64>(),
+            Amount64::from(6)
+        );
+        assert_eq!(vals.iter().product::<Amount64>(), Amount64::from(6));
+        // Empty iterators yield the identities.
+        assert_eq!(
+            core::iter::empty::<Amount64>().sum::<Amount64>(),
+            Amount64::ZERO
+        );
+        assert_eq!(
+            core::iter::empty::<Amount64>().product::<Amount64>(),
+            Amount64::ONE
+        );
+    }
+
+    #[test]
+    fn test_display_error_fallback() {
+        // A precision beyond the 128-byte format buffer cannot be rendered;
+        // Display falls back to the documented error marker.
+        assert_eq!(format!("{:.200}", Decimal::<4>(10000)), "Amount::ERROR");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde() {
+        use core::fmt::Write as _;
+        use serde::de::value::{Error as ValueError, StrDeserializer};
+        use serde::ser::{Error as _, Impossible};
+        use serde::{Deserialize, Serialize, Serializer};
+        use std::string::String;
+
+        // Minimal hand-rolled serializer: only `collect_str` (the one entry
+        // point `Decimal`'s `Serialize` uses) does real work; every other
+        // shape is rejected.
+        struct StrCollector;
+
+        macro_rules! reject {
+            ($($m:ident($($arg:ty),*) -> $ok:ty;)*) => {$(
+                fn $m(self, $(_: $arg),*) -> Result<$ok, ValueError> {
+                    Err(ValueError::custom("unsupported"))
+                }
+            )*};
+        }
+
+        impl Serializer for StrCollector {
+            type Ok = String;
+            type Error = ValueError;
+            type SerializeSeq = Impossible<String, ValueError>;
+            type SerializeTuple = Impossible<String, ValueError>;
+            type SerializeTupleStruct = Impossible<String, ValueError>;
+            type SerializeTupleVariant = Impossible<String, ValueError>;
+            type SerializeMap = Impossible<String, ValueError>;
+            type SerializeStruct = Impossible<String, ValueError>;
+            type SerializeStructVariant = Impossible<String, ValueError>;
+
+            fn collect_str<T>(self, value: &T) -> Result<String, ValueError>
+            where
+                T: ?Sized + core::fmt::Display,
+            {
+                let mut out = String::new();
+                write!(out, "{value}").map_err(|_| ValueError::custom("fmt"))?;
+                Ok(out)
+            }
+
+            reject! {
+                serialize_bool(bool) -> String;
+                serialize_i8(i8) -> String;
+                serialize_i16(i16) -> String;
+                serialize_i32(i32) -> String;
+                serialize_i64(i64) -> String;
+                serialize_u8(u8) -> String;
+                serialize_u16(u16) -> String;
+                serialize_u32(u32) -> String;
+                serialize_u64(u64) -> String;
+                serialize_f32(f32) -> String;
+                serialize_f64(f64) -> String;
+                serialize_char(char) -> String;
+                serialize_str(&str) -> String;
+                serialize_bytes(&[u8]) -> String;
+                serialize_none() -> String;
+                serialize_unit() -> String;
+                serialize_unit_struct(&'static str) -> String;
+                serialize_unit_variant(&'static str, u32, &'static str) -> String;
+                serialize_seq(Option<usize>) -> Self::SerializeSeq;
+                serialize_tuple(usize) -> Self::SerializeTuple;
+                serialize_tuple_struct(&'static str, usize) -> Self::SerializeTupleStruct;
+                serialize_tuple_variant(&'static str, u32, &'static str, usize) -> Self::SerializeTupleVariant;
+                serialize_map(Option<usize>) -> Self::SerializeMap;
+                serialize_struct(&'static str, usize) -> Self::SerializeStruct;
+                serialize_struct_variant(&'static str, u32, &'static str, usize) -> Self::SerializeStructVariant;
+            }
+
+            fn serialize_some<T>(self, _: &T) -> Result<String, ValueError>
+            where
+                T: ?Sized + Serialize,
+            {
+                Err(ValueError::custom("unsupported"))
+            }
+
+            fn serialize_newtype_struct<T>(
+                self,
+                _: &'static str,
+                _: &T,
+            ) -> Result<String, ValueError>
+            where
+                T: ?Sized + Serialize,
+            {
+                Err(ValueError::custom("unsupported"))
+            }
+
+            fn serialize_newtype_variant<T>(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: &T,
+            ) -> Result<String, ValueError>
+            where
+                T: ?Sized + Serialize,
+            {
+                Err(ValueError::custom("unsupported"))
+            }
+        }
+
+        fn de(s: &str) -> Result<Amount64, ValueError> {
+            Amount64::deserialize(StrDeserializer::<ValueError>::new(s))
+        }
+
+        // Serialize emits the Display string (trailing zeros trimmed).
+        let a = Amount64::from_str_const("1.0001");
+        assert_eq!(a.serialize(StrCollector), Ok(String::from("1.0001")));
+        assert_eq!(
+            Amount64::from_str_const("-0.5").serialize(StrCollector),
+            Ok(String::from("-0.5"))
+        );
+        assert_eq!(
+            Amount64::ZERO.serialize(StrCollector),
+            Ok(String::from("0"))
+        );
+
+        // Deserialize parses the string form back with HalfUp, like FromStr.
+        assert_eq!(de("1.0001"), Ok(a));
+        assert_eq!(de("1.00005"), Ok(Decimal::<4>(10001)));
+        assert_eq!(de("-0.5"), Ok(Decimal::<4>(-5000)));
+
+        // Full round-trip through both traits at another scale.
+        let r = Rate64::from_str_const("0.12345678");
+        let s = r.serialize(StrCollector).unwrap();
+        assert_eq!(s, "0.12345678");
+        assert_eq!(
+            Rate64::deserialize(StrDeserializer::<ValueError>::new(&s)),
+            Ok(r)
+        );
+
+        // Invalid strings surface as a deserializer error (the message is
+        // erased because serde is built without alloc).
+        assert!(de("not-a-number").is_err());
+        assert!(de("").is_err());
+        assert!(de("922337203685477.5808").is_err());
+
+        // A non-string input is a type error, reported through the visitor's
+        // expecting() message.
+        let non_str =
+            Amount64::deserialize(serde::de::value::I32Deserializer::<ValueError>::new(5));
+        assert!(non_str.is_err());
     }
 
     #[cfg(feature = "ufmt")]

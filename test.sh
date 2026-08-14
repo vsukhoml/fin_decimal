@@ -9,9 +9,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # Minimum acceptable line coverage (%, whole crate, lib tests). Current level
-# is ~89%; the floor is set below it to catch real regressions, not noise.
+# is ~98%; the floor is set below it to catch real regressions, not noise.
 # Raise it as coverage improves.
-COVERAGE_MIN_LINES=85
+COVERAGE_MIN_LINES=95
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
@@ -38,7 +38,10 @@ step "Assembly codegen contract (check_asm.sh asm)"
 
 if command -v cargo-llvm-cov > /dev/null; then
     step "Coverage (cargo llvm-cov --lib, floor: ${COVERAGE_MIN_LINES}% lines)"
-    cargo llvm-cov --lib --summary-only --fail-under-lines "$COVERAGE_MIN_LINES"
+    # serde,ufmt are included so their impls are measured; asm is left off so
+    # the portable division paths stay measured.
+    cargo llvm-cov --lib --features serde,ufmt --summary-only \
+        --fail-under-lines "$COVERAGE_MIN_LINES"
 else
     step "Coverage"
     echo "error: cargo-llvm-cov not installed (cargo install cargo-llvm-cov)" >&2

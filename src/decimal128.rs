@@ -470,13 +470,14 @@ impl<const DIGITS: u8> Decimal128<DIGITS> {
     /// ```
     /// use fin_decimal::Amount128;
     /// assert_eq!(Amount128::from_f64(3.01).unwrap().ceil(), Amount128::from(4));
+    /// assert_eq!(Amount128::from_f64(-3.7).unwrap().ceil(), Amount128::from(-3));
     /// ```
     pub const fn ceil(self) -> Self {
         let mut frac = self.frac_rem();
         if frac != 0 {
-            if self.0 < 0 {
-                frac += Self::SCALE_INT
-            } else {
+            // For negatives, ceiling is truncation: dropping the (negative)
+            // fraction already moves toward +inf.
+            if self.0 > 0 {
                 frac -= Self::SCALE_INT
             }
             Decimal128::<DIGITS>(self.0 - frac)
@@ -1200,6 +1201,22 @@ mod tests {
         const E: Amount128 = Amount128::from_str_const("1.01").powi(12);
         const F: Option<Amount128> = A.checked_mul(A);
         const G: Amount128 = A.fract();
+        const H: Amount128 = Amount128::from_bits(-15000).abs();
+        const I: Option<Amount128> = Amount128::ONE.checked_add(Amount128::ONE);
+        const J: Option<Amount128> = Amount128::MIN.checked_sub(Amount128::ONE);
+        const K: Amount128 = Amount128::from_str_const("-3.25").floor();
+        const L: Amount128 = Amount128::from_str_const("3.25").ceil();
+        const M: Result<Amount128, AmountErrorKind> =
+            Amount128::from_decimal_parts_rounded(12345, -5, Rounding::HalfEven);
+        const N: Result<Amount128, AmountErrorKind> = Amount128::from_i128(7);
+
+        assert_eq!(H, Amount128::from_bits(15000));
+        assert_eq!(I, Some(Amount128::from(2)));
+        assert_eq!(J, None);
+        assert_eq!(K, Amount128::from(-4));
+        assert_eq!(L, Amount128::from(4));
+        assert_eq!(M, Ok(Amount128::from_bits(1234)));
+        assert_eq!(N, Ok(Amount128::from(7)));
 
         let a = Amount128::from_str("123456789012345.6789").unwrap();
         assert_eq!(A, a);
@@ -1265,6 +1282,347 @@ mod tests {
         let _ = Amount128::from(1) % Amount128::ZERO;
     }
 
+    #[test]
+    fn test_new_and_conversions() {
+        assert_eq!(Amount128::new(), Amount128::ZERO);
+
+        assert_eq!(Amount128::from_f32(1.5), Ok(Amount128::from_bits(15000)));
+        assert_eq!(
+            Amount128::from_f32(f32::MAX),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(Amount128::from_f64(1e35), Err(AmountErrorKind::Overflow));
+        assert_eq!(Amount128::from_f64(-1e35), Err(AmountErrorKind::Overflow));
+
+        assert_eq!(Amount128::from_i128(7), Ok(Amount128::from(7)));
+        assert_eq!(
+            Amount128::from_i128(i128::MAX),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(
+            Amount128::from_i128(i128::MIN),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(Amount128::from_i64(-7), Ok(Amount128::from(-7)));
+
+        assert_eq!(Amount128::from(2).to_f64(), 2.0);
+        assert_eq!(Amount128::from_bits(-2500).to_f64(), -0.25);
+        // to_i128 truncates toward zero.
+        assert_eq!(Amount128::from_f64(3.7).unwrap().to_i128(), 3);
+        assert_eq!(Amount128::from_f64(-3.7).unwrap().to_i128(), -3);
+    }
+
+    #[test]
+    fn test_abs_checked_add_sub() {
+        assert_eq!(Amount128::from(-3).abs(), Amount128::from(3));
+        assert_eq!(Amount128::from(3).abs(), Amount128::from(3));
+
+        assert_eq!(
+            Amount128::from(2).checked_add(Amount128::from(3)),
+            Some(Amount128::from(5))
+        );
+        assert_eq!(
+            Amount128::from(3).checked_sub(Amount128::from(1)),
+            Some(Amount128::from(2))
+        );
+        assert_eq!(Amount128::MIN.checked_sub(Amount128::from(1)), None);
+    }
+
+    #[test]
+    fn test_from_decimal_parts_range_errors() {
+        // Scale-up factor 10^44 exceeds i128: Overflow.
+        assert_eq!(
+            Amount128::from_decimal_parts(1, 40),
+            Err(AmountErrorKind::Overflow)
+        );
+        // Scale-down divisor 10^46 exceeds i128: any non-zero mantissa is Inexact.
+        assert_eq!(
+            Amount128::from_decimal_parts(1, -50),
+            Err(AmountErrorKind::Inexact)
+        );
+    }
+
+    #[test]
+    fn test_from_decimal_parts_rounded_branches() {
+        use crate::Rounding::*;
+        // Zero mantissa short-circuits regardless of exponent.
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(0, 1000, HalfUp),
+            Ok(Amount128::ZERO)
+        );
+        // Scale up exactly.
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(123, -2, HalfUp),
+            Ok(Amount128::from_bits(12300))
+        );
+        // Scale-up overflow: factor out of range, then product out of range.
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(1, 40, HalfUp),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(i128::MAX, 0, HalfUp),
+            Err(AmountErrorKind::Overflow)
+        );
+        // |value| < 0.5 ULP (divisor 10^56 exceeds i128): rounds to zero,
+        // except `Up`, which yields one signed ULP.
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(7, -60, Up),
+            Ok(Amount128::from_bits(1))
+        );
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(-7, -60, Up),
+            Ok(Amount128::from_bits(-1))
+        );
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(7, -60, HalfUp),
+            Ok(Amount128::ZERO)
+        );
+        // 1.2345 at one dropped digit: rem == half, quotient 1234 is even.
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(12345, -5, HalfEven),
+            Ok(Amount128::from_bits(1234))
+        );
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(12345, -5, HalfDown),
+            Ok(Amount128::from_bits(1234))
+        );
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(12345, -5, Down),
+            Ok(Amount128::from_bits(1234))
+        );
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(12345, -5, Up),
+            Ok(Amount128::from_bits(1235))
+        );
+        // Odd quotient tie rounds up under HalfEven; above-half rounds up.
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(12355, -5, HalfEven),
+            Ok(Amount128::from_bits(1236))
+        );
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(12346, -5, HalfEven),
+            Ok(Amount128::from_bits(1235))
+        );
+        // Sign is carried through the magnitude rounding.
+        assert_eq!(
+            Amount128::from_decimal_parts_rounded(-12345, -5, Up),
+            Ok(Amount128::from_bits(-1235))
+        );
+    }
+
+    #[test]
+    fn test_from_str_const_runtime() {
+        assert_eq!(
+            Amount128::from_str_const("0.0035"),
+            Amount128::from_bits(35)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid decimal literal")]
+    fn test_from_str_const_invalid() {
+        let _ = Amount128::from_str_const("1.2.3");
+    }
+
+    #[test]
+    fn test_floor_ceil_round_branches() {
+        // Non-negative floor takes the plain truncation branch.
+        assert_eq!(
+            Amount128::from_f64(3.7).unwrap().floor(),
+            Amount128::from(3)
+        );
+        assert_eq!(Amount128::from(-4).floor(), Amount128::from(-4));
+        // Negative ceil truncates toward +inf (mathematical ceiling).
+        assert_eq!(
+            Amount128::from_f64(-3.2).unwrap().ceil(),
+            Amount128::from(-3)
+        );
+        assert_eq!(Amount128::from(5).ceil(), Amount128::from(5));
+        // Positive half rounds away from zero.
+        assert_eq!(
+            Amount128::from_f64(3.5).unwrap().round(),
+            Amount128::from(4)
+        );
+        assert_eq!(
+            Amount128::from_f64(3.4).unwrap().round(),
+            Amount128::from(3)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to round with overflow")]
+    fn test_round_to_overflow() {
+        // MAX has fractional digits .5727; rounding up exceeds the range.
+        let _ = Amount128::MAX.round_to(Rounding::Up);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to multiply with overflow")]
+    fn test_mul_rounded_overflow() {
+        let _ = Amount128::MAX.mul_rounded(Amount128::from(2), Rounding::HalfUp);
+    }
+
+    #[test]
+    fn test_checked_rounded_forms() {
+        assert_eq!(
+            Amount128::MAX.checked_mul_rounded(Amount128::from(2), Rounding::HalfUp),
+            None
+        );
+        assert_eq!(
+            Amount128::from(3).checked_mul_rounded(Amount128::from(2), Rounding::HalfUp),
+            Some(Amount128::from(6))
+        );
+        assert_eq!(
+            Amount128::from(1).checked_div_rounded(Amount128::from(3), Rounding::Up),
+            Some(Amount128::from_bits(3334))
+        );
+        assert_eq!(
+            Amount128::from(1).checked_div_rounded(Amount128::ZERO, Rounding::HalfUp),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_div_rounded_by_zero() {
+        let _ = Amount128::from(1).div_rounded(Amount128::ZERO, Rounding::HalfUp);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide with overflow")]
+    fn test_div_rounded_overflow() {
+        // MAX / 0.5 doubles the largest value.
+        let _ = Amount128::MAX.div_rounded(Amount128::from_bits(5000), Rounding::HalfUp);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_div_int_rounded_by_zero() {
+        let _ = Amount128::from(1).div_int_rounded(0, Rounding::HalfUp);
+    }
+
+    #[test]
+    fn test_checked_div_int_rounded_zero() {
+        assert_eq!(
+            Amount128::from(1).checked_div_int_rounded(0, Rounding::HalfUp),
+            None
+        );
+        assert_eq!(
+            Amount128::from(1).checked_div_int_rounded(3, Rounding::Down),
+            Some(Amount128::from_bits(3333))
+        );
+    }
+
+    #[test]
+    fn test_sign_predicates_bits_bytes() {
+        assert!(Amount128::from(1).is_positive());
+        assert!(!Amount128::ZERO.is_positive());
+        assert!(!Amount128::from(-1).is_positive());
+        assert!(Amount128::from(-1).is_negative());
+        assert!(!Amount128::ZERO.is_negative());
+        assert!(!Amount128::from(1).is_negative());
+
+        assert_eq!(Amount128::from_bits(123).to_bits(), 123);
+
+        let be = Amount128::from(1).to_be_bytes();
+        assert_eq!(&be[14..], &[0x27, 0x10]); // 10000 == 0x2710
+        assert_eq!(Amount128::from_be_bytes(be), Amount128::from(1));
+        assert_eq!(
+            Amount128::from_be_bytes(Amount128::from(-1).to_be_bytes()),
+            Amount128::from(-1)
+        );
+    }
+
+    #[test]
+    fn test_clamp_min_max() {
+        let (lo, hi) = (Amount128::ZERO, Amount128::ONE);
+        assert_eq!(Amount128::from(-5).clamp(lo, hi), lo);
+        assert_eq!(
+            Amount128::from_bits(5000).clamp(lo, hi),
+            Amount128::from_bits(5000)
+        );
+
+        let (a, b) = (Amount128::from(1), Amount128::from(2));
+        assert_eq!(a.min(b), a);
+        assert_eq!(b.min(a), a);
+        assert_eq!(a.max(b), b);
+        assert_eq!(b.max(a), b);
+    }
+
+    #[test]
+    fn test_from_saturating() {
+        // From<i128> saturates out-of-range values.
+        assert_eq!(Amount128::from(5i128), Amount128::from(5));
+        assert_eq!(Amount128::from(i128::MAX), Amount128::MAX);
+        assert_eq!(Amount128::from(i128::MIN), Amount128::MIN);
+        // From<f64> saturates likewise.
+        assert_eq!(Amount128::from(2.5f64), Amount128::from_bits(25000));
+        assert_eq!(Amount128::from(1e40f64), Amount128::MAX);
+        assert_eq!(Amount128::from(-1e40f64), Amount128::MIN);
+        // From<f32> goes through f64.
+        assert_eq!(Amount128::from(1.5f32), Amount128::from_bits(15000));
+    }
+
+    #[test]
+    fn test_int_operand_ops() {
+        let a = Amount128::from(10);
+        assert_eq!(a + 5i64, Amount128::from(15));
+        assert_eq!(a + 5i32, Amount128::from(15));
+        assert_eq!(a - 3i64, Amount128::from(7));
+        assert_eq!(a - 3i32, Amount128::from(7));
+        assert_eq!(a * 2i64, Amount128::from(20));
+        assert_eq!(a * -2i32, Amount128::from(-20));
+    }
+
+    #[test]
+    fn test_assign_ops() {
+        let mut v = Amount128::from(10);
+        v += Amount128::from(2);
+        assert_eq!(v, Amount128::from(12));
+        v -= Amount128::from(4);
+        assert_eq!(v, Amount128::from(8));
+        v *= Amount128::from(2);
+        assert_eq!(v, Amount128::from(16));
+        v /= Amount128::from(4);
+        assert_eq!(v, Amount128::from(4));
+        v %= Amount128::from(3);
+        assert_eq!(v, Amount128::from(1));
+    }
+
+    #[test]
+    fn test_from_str_and_iter_traits() {
+        // From<&str> panics on bad input, parses good input.
+        assert_eq!(Amount128::from("1.5"), Amount128::from_bits(15000));
+
+        let arr = [Amount128::from(1), Amount128::from(2), Amount128::from(3)];
+        // By-reference Sum/Product over an iterator of &Amount128.
+        let s: Amount128 = arr.iter().sum();
+        assert_eq!(s, Amount128::from(6));
+        let p: Amount128 = arr.iter().product();
+        assert_eq!(p, Amount128::from(6));
+        // By-value Product (owned iterator).
+        let p: Amount128 = arr.iter().copied().product();
+        assert_eq!(p, Amount128::from(6));
+        // Empty iterators yield the identities.
+        assert_eq!([].iter().sum::<Amount128>(), Amount128::ZERO);
+        assert_eq!([].iter().product::<Amount128>(), Amount128::ONE);
+    }
+
+    #[test]
+    #[should_panic(expected = "called `Result::unwrap()` on an `Err` value")]
+    fn test_from_str_ref_invalid() {
+        let _ = Amount128::from("not a number");
+    }
+
+    #[test]
+    fn test_display_precision_fallback() {
+        let x = Amount128::from_bits(15000);
+        assert_eq!(format!("{x:.2}"), "1.50");
+        // Requested precision cannot fit the 128-byte format buffer.
+        assert_eq!(format!("{x:.200}"), "Amount::ERROR");
+    }
+
     /// Differential test: for values within the i64 range, Decimal128 must
     /// agree with Decimal (the i64-backed type) on every operation and
     /// rounding mode.
@@ -1295,6 +1653,14 @@ mod tests {
             assert_eq!((da * db).0 as i128, (wa * wb).0, "mul {a} * {b}");
             assert_eq!(format!("{da}"), format!("{wa}"));
             assert_eq!(format!("{da:.2}"), format!("{wa:.2}"));
+
+            // The hand-rolled integer-rounding helpers (unlike round_to,
+            // these have per-backing implementations).
+            assert_eq!(da.ceil().0 as i128, wa.ceil().0, "ceil {a}");
+            assert_eq!(da.floor().0 as i128, wa.floor().0, "floor {a}");
+            assert_eq!(da.round().0 as i128, wa.round().0, "round {a}");
+            assert_eq!(da.trunc().0 as i128, wa.trunc().0, "trunc {a}");
+            assert_eq!(da.fract().0 as i128, wa.fract().0, "fract {a}");
 
             // Cross-scale operands (an 8-digit rate) for mul_rounded.
             let rb = Decimal::<8>(b);

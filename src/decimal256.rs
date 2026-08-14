@@ -500,6 +500,7 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
     /// ```
     /// use fin_decimal::Amount256;
     /// assert_eq!(Amount256::from_f64(3.01).unwrap().ceil(), Amount256::from(4));
+    /// assert_eq!(Amount256::from_f64(-3.7).unwrap().ceil(), Amount256::from(-3));
     /// ```
     #[inline]
     pub const fn ceil(self) -> Self {
@@ -1160,6 +1161,10 @@ mod tests {
         // Too large.
         let huge = "9".repeat(80);
         assert_eq!(Amount256::from_str(&huge), Err(AmountErrorKind::Overflow));
+        // Parses into four limbs (6e76 < 2^256) but exceeds the symmetric
+        // 255-bit range bound (2^255 ~ 5.79e76): rejected after the parse.
+        let s = "6".to_string() + &"0".repeat(72);
+        assert_eq!(Amount256::from_str(&s), Err(AmountErrorKind::Overflow));
 
         assert_eq!(&format!("{}", raw(10000)), "1");
         assert_eq!(&format!("{:+}", raw(10000)), "+1");
@@ -1238,6 +1243,201 @@ mod tests {
     }
 
     #[test]
+    fn test_constructors_and_float_intake() {
+        assert_eq!(Amount256::new(), Amount256::ZERO);
+        assert_eq!(Amount256::from_f32(0.5f32), Ok(raw(5000)));
+        assert_eq!(
+            Amount256::from_f32(f32::INFINITY),
+            Err(AmountErrorKind::Overflow)
+        );
+        assert_eq!(Amount256::from_str_const("1.5"), raw(15000));
+
+        // Wide negative f64: |val * 10^4| > 2^127 and negative, so the
+        // truncation toward zero overshoots and the floor adjustment
+        // (hi -= 1, lo += 2^128) runs. The split is exact for this value,
+        // so the result is the exact negation of the positive intake.
+        let x = 1.5e42_f64;
+        let pos = Amount256::from_f64(x).unwrap();
+        let neg = Amount256::from_f64(-x).unwrap();
+        assert_eq!(neg, -pos);
+        assert!((neg.to_f64() + x).abs() / x < 1e-15);
+    }
+
+    #[test]
+    fn test_checked_variants() {
+        let six = Amount256::from(6);
+        let two = Amount256::from(2);
+        assert_eq!(six.checked_add(two), Some(Amount256::from(8)));
+        assert_eq!(six.checked_sub(two), Some(Amount256::from(4)));
+        assert_eq!(six.checked_mul(two), Some(Amount256::from(12)));
+        assert_eq!(
+            six.checked_mul_rounded(two, Rounding::HalfUp),
+            Some(Amount256::from(12))
+        );
+        assert_eq!(
+            Amount256::MAX.checked_mul_rounded(two, Rounding::HalfUp),
+            None
+        );
+        assert_eq!(
+            six.checked_div_rounded(two, Rounding::HalfUp),
+            Some(Amount256::from(3))
+        );
+        assert_eq!(
+            six.checked_div_rounded(Amount256::ZERO, Rounding::HalfUp),
+            None
+        );
+        // MAX / 0.5 overflows.
+        assert_eq!(
+            Amount256::MAX.checked_div_rounded(raw(5000), Rounding::HalfUp),
+            None
+        );
+        assert_eq!(six.checked_div_int_rounded(0, Rounding::HalfUp), None);
+        assert_eq!(
+            six.checked_div_int_rounded(4, Rounding::HalfUp),
+            Some(raw(15000))
+        );
+    }
+
+    #[test]
+    fn test_rem_dividend_narrower_than_divisor() {
+        // Divisor magnitude spans all four limbs while the dividend fits one:
+        // |a| < |b|, so the remainder is the dividend itself.
+        let big = Amount256::from(10i128.pow(36));
+        let wide = big * big;
+        assert_eq!(Amount256::from(7) % wide, Amount256::from(7));
+        assert_eq!(Amount256::from(-7) % wide, Amount256::from(-7));
+        // Two-limb divisor, one-limb dividend: same branch, shorter widths.
+        let mid = Amount256::from(10i128.pow(18));
+        assert_eq!(Amount256::from(7) % mid, Amount256::from(7));
+    }
+
+    #[test]
+    fn test_misc_branches() {
+        // abs of a non-negative value returns self.
+        assert_eq!(Amount256::from(3).abs(), Amount256::from(3));
+        assert_eq!(Amount256::ZERO.abs(), Amount256::ZERO);
+        // to_bits / from_bits round trip.
+        let v = Amount256::from(-42);
+        assert_eq!(Amount256::from_bits(v.to_bits()), v);
+        assert_eq!(Amount256::ONE.to_bits(), I256::from_i128(10000));
+        // clamp: below, inside, above.
+        let (lo, hi) = (Amount256::ZERO, Amount256::ONE);
+        assert_eq!(Amount256::from(-5).clamp(lo, hi), lo);
+        assert_eq!(raw(5000).clamp(lo, hi), raw(5000));
+        assert_eq!(Amount256::from(5).clamp(lo, hi), hi);
+        // min / max, both orders.
+        let a = Amount256::from(1);
+        let b = Amount256::from(2);
+        assert_eq!(a.min(b), a);
+        assert_eq!(b.min(a), a);
+        assert_eq!(a.max(b), b);
+        assert_eq!(b.max(a), b);
+        // Mixed integer conversions and operators.
+        assert_eq!(Amount256::from(3i64), raw(30000));
+        assert_eq!(Amount256::from(7) + 3i32, Amount256::from(10));
+        assert_eq!(Amount256::from(7) - 3i32, Amount256::from(4));
+    }
+
+    #[test]
+    fn test_common_macro_surface() {
+        // Assign operators.
+        let mut v = Amount256::from(10);
+        v += Amount256::from(2);
+        assert_eq!(v, Amount256::from(12));
+        v -= Amount256::from(4);
+        assert_eq!(v, Amount256::from(8));
+        v *= Amount256::from(3);
+        assert_eq!(v, Amount256::from(24));
+        v /= Amount256::from(6);
+        assert_eq!(v, Amount256::from(4));
+        v %= Amount256::from(3);
+        assert_eq!(v, Amount256::from(1));
+
+        // From<&str> (panicking string conversion).
+        assert_eq!(Amount256::from("1.0001"), raw(10001));
+        assert_eq!(Amount256::from("-2"), Amount256::from(-2));
+
+        // Sum / Product over iterators of references.
+        let xs = [Amount256::from(1), Amount256::from(2), Amount256::from(3)];
+        let s: Amount256 = xs.iter().sum();
+        assert_eq!(s, Amount256::from(6));
+        let p: Amount256 = xs.iter().product();
+        assert_eq!(p, Amount256::from(6));
+
+        // Display with explicit precision: rounding (half away from zero),
+        // zero-padding past the scale, and sign pass-through.
+        assert_eq!(format!("{:.1}", raw(10500)), "1.1");
+        assert_eq!(format!("{:.1}", raw(10450)), "1.0");
+        assert_eq!(format!("{:.6}", raw(-10001)), "-1.000100");
+        // Precision beyond the 128-byte format buffer falls back to the
+        // error marker instead of overrunning.
+        assert_eq!(format!("{:.200}", Amount256::ONE), "Amount::ERROR");
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to add with overflow")]
+    fn test_add_overflow_panics() {
+        let _ = Amount256::MAX + raw(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to subtract with overflow")]
+    fn test_sub_overflow_panics() {
+        let _ = Amount256::MIN - raw(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to multiply with overflow")]
+    fn test_mul_overflow_panics() {
+        let _ = Amount256::MAX * Amount256::from(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to multiply with overflow")]
+    fn test_mul_i64_overflow_panics() {
+        let _ = Amount256::MAX * 2i64;
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_div_by_zero_panics() {
+        let _ = Amount256::ONE / Amount256::ZERO;
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide with overflow")]
+    fn test_div_overflow_panics() {
+        // MAX / 0.5 overflows.
+        let _ = Amount256::MAX.div_rounded(raw(5000), Rounding::HalfUp);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_div_int_by_zero_panics() {
+        let _ = Amount256::ONE.div_int_rounded(0, Rounding::HalfUp);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to calculate the remainder with a divisor of zero")]
+    fn test_rem_by_zero_panics() {
+        let _ = Amount256::ONE % Amount256::ZERO;
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to round with overflow")]
+    fn test_round_to_overflow_panics() {
+        // MAX's mantissa is 2^255 - 1 = ...9967 mod 10^4: rounding up the
+        // non-zero fraction overflows the range.
+        let _ = Amount256::MAX.round_to(Rounding::Up);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid decimal literal")]
+    fn test_from_str_const_invalid_panics() {
+        let _ = Amount256::from_str_const("not a number");
+    }
+
+    #[test]
     fn test_const_eval() {
         const A: Amount256 = Amount256::from_str_const(
             "123456789012345678901234567890123456789012345678901234.5678",
@@ -1247,6 +1447,10 @@ mod tests {
         const D: Amount256 = A.trunc();
         const E: Amount256 = Amount256::from_str_const("2").powi(100);
         const F: Option<Amount256> = A.checked_mul(A); // overflows -> None
+        const G: Option<Amount256> = Amount256::ONE.checked_add(Amount256::ONE);
+        const H: Amount256 = Amount256::from_i64(-3).abs();
+        const BITS: I256 = Amount256::ONE.to_bits();
+        const T: Amount256 = Amount256::from_bits(BITS);
 
         let a = Amount256::from_str("123456789012345678901234567890123456789012345678901234.5678")
             .unwrap();
@@ -1259,6 +1463,9 @@ mod tests {
         assert_eq!(D, a.trunc());
         assert_eq!(E.to_string(), "1267650600228229401496703205376");
         assert_eq!(F, None);
+        assert_eq!(G, Some(Amount256::from(2)));
+        assert_eq!(H, Amount256::from(3));
+        assert_eq!(T, Amount256::ONE);
     }
 
     /// Differential test: for values within the i128 range, Decimal256 must
@@ -1301,6 +1508,14 @@ mod tests {
             assert_eq!((da * db).0, to128(wa * wb), "mul {a} * {b}");
             assert_eq!(format!("{da}"), format!("{wa}"));
             assert_eq!(format!("{da:.2}"), format!("{wa:.2}"));
+
+            // The hand-rolled integer-rounding helpers (unlike round_to,
+            // these have per-backing implementations).
+            assert_eq!(da.ceil().0, to128(wa.ceil()), "ceil {a}");
+            assert_eq!(da.floor().0, to128(wa.floor()), "floor {a}");
+            assert_eq!(da.round().0, to128(wa.round()), "round {a}");
+            assert_eq!(da.trunc().0, to128(wa.trunc()), "trunc {a}");
+            assert_eq!(da.fract().0, to128(wa.fract()), "fract {a}");
 
             // Cross-scale operands (an 8-digit rate) for mul_rounded.
             let rb = Decimal128::<8>(b);

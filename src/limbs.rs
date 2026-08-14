@@ -1367,6 +1367,421 @@ mod tests {
         }
     }
 
+    /// Path flags reported by [`div_knuth_probed`], used to assert that the
+    /// hard branches of algorithm D are actually exercised by the tests.
+    #[derive(Default)]
+    struct DivKnuthProbe {
+        /// Largest number of D3 correction-loop decrements at any position.
+        max_corrections: u32,
+        /// The add-back step (D6, `t < 0`) fired.
+        addback: bool,
+        /// The `un[j+n] == vtop` estimate branch (`qhat` starts `>= B`) ran.
+        eq_estimate: bool,
+        /// `qhat >= B` survived the correction loop (must never happen: the
+        /// multiply-subtract truncates `qhat` to one limb).
+        qhat_overflow: bool,
+    }
+
+    /// Instrumented copy of [`div_knuth`] reporting which hard paths ran.
+    ///
+    /// Kept in lockstep with the real function by
+    /// `test_div_knuth_d3_adversarial`, which asserts identical `q`/`r` on
+    /// every case, so any drift between the two is caught immediately.
+    fn div_knuth_probed(q: &mut [u64], r: &mut [u64], u: &[u64], v: &[u64]) -> DivKnuthProbe {
+        let m = u.len();
+        let n = v.len();
+        let mut un = [0u64; KNUTH_MAX_M + 1];
+        let mut vn = [0u64; KNUTH_MAX_M];
+        let s = v[n - 1].leading_zeros();
+        if s == 0 {
+            vn[..n].copy_from_slice(v);
+            un[..m].copy_from_slice(u);
+            un[m] = 0;
+        } else {
+            for i in (1..n).rev() {
+                vn[i] = (v[i] << s) | (v[i - 1] >> (64 - s));
+            }
+            vn[0] = v[0] << s;
+            un[m] = u[m - 1] >> (64 - s);
+            for i in (1..m).rev() {
+                un[i] = (u[i] << s) | (u[i - 1] >> (64 - s));
+            }
+            un[0] = u[0] << s;
+        }
+        for x in q.iter_mut() {
+            *x = 0;
+        }
+        const B: u128 = 1u128 << 64;
+        let vtop = vn[n - 1];
+        let vnext = vn[n - 2];
+        let mut probe = DivKnuthProbe::default();
+        let mut j = m - n;
+        loop {
+            let (mut qhat, mut rhat): (u128, u128) = if un[j + n] == vtop {
+                probe.eq_estimate = true;
+                (
+                    B + (un[j + n - 1] / vtop) as u128,
+                    (un[j + n - 1] % vtop) as u128,
+                )
+            } else {
+                let (q0, r0) = div_2by1(un[j + n], un[j + n - 1], vtop);
+                (q0 as u128, r0 as u128)
+            };
+            let mut corrections = 0u32;
+            loop {
+                if qhat >= B || qhat * (vnext as u128) > ((rhat << 64) | un[j + n - 2] as u128) {
+                    qhat -= 1;
+                    corrections += 1;
+                    rhat += vtop as u128;
+                    if rhat < B {
+                        continue;
+                    }
+                }
+                break;
+            }
+            probe.max_corrections = probe.max_corrections.max(corrections);
+            if qhat >= B {
+                probe.qhat_overflow = true;
+            }
+            let mut qd = qhat as u64;
+            let mut borrow: i128 = 0;
+            for i in 0..n {
+                let p = (qd as u128) * (vn[i] as u128);
+                let t = (un[i + j] as i128) - borrow - ((p as u64) as i128);
+                un[i + j] = t as u64;
+                borrow = ((p >> 64) as i128) - (t >> 64);
+            }
+            let t = (un[j + n] as i128) - borrow;
+            un[j + n] = t as u64;
+            if t < 0 {
+                probe.addback = true;
+                qd -= 1;
+                let mut carry: u128 = 0;
+                for i in 0..n {
+                    let sum = un[i + j] as u128 + vn[i] as u128 + carry;
+                    un[i + j] = sum as u64;
+                    carry = sum >> 64;
+                }
+                un[j + n] = un[j + n].wrapping_add(carry as u64);
+            }
+            q[j] = qd;
+            if j == 0 {
+                break;
+            }
+            j -= 1;
+        }
+        if s == 0 {
+            r[..n].copy_from_slice(&un[..n]);
+        } else {
+            for i in 0..n - 1 {
+                r[i] = (un[i] >> s) | (un[i + 1] << (64 - s));
+            }
+            r[n - 1] = un[n - 1] >> s;
+        }
+        for x in r.iter_mut().skip(n) {
+            *x = 0;
+        }
+        probe
+    }
+
+    /// Oracle for a single division: checks `r < v` and `q * v + r == u`,
+    /// runs the probed copy, and asserts it agrees with [`div_knuth`].
+    fn check_div_knuth(u: &[u64], v: &[u64]) -> DivKnuthProbe {
+        let m = u.len();
+        let n = v.len();
+        let mut q = [0u64; KNUTH_MAX_M];
+        let mut r = [0u64; KNUTH_MAX_M];
+        div_knuth(&mut q[..m - n + 1], &mut r[..n], u, v);
+
+        let mut q2 = [0u64; KNUTH_MAX_M];
+        let mut r2 = [0u64; KNUTH_MAX_M];
+        let probe = div_knuth_probed(&mut q2[..m - n + 1], &mut r2[..n], u, v);
+        assert_eq!(q, q2, "probed copy diverged: u={u:?} v={v:?}");
+        assert_eq!(r, r2, "probed copy diverged: u={u:?} v={v:?}");
+        assert!(
+            !probe.qhat_overflow,
+            "qhat >= B survived the correction loop: u={u:?} v={v:?}"
+        );
+
+        assert_eq!(cmp_words(&r[..n], &v[..n]), Ordering::Less, "r >= v");
+        let mut prod = [0u64; 2 * KNUTH_MAX_M + 1];
+        mul_words(&mut prod[..m + 1], &q[..m - n + 1], &v[..n]);
+        let mut carry: u128 = 0;
+        for (i, p) in prod.iter_mut().enumerate() {
+            let add = if i < n { r[i] as u128 } else { 0 };
+            let s = *p as u128 + add + carry;
+            *p = s as u64;
+            carry = s >> 64;
+        }
+        assert_eq!(&prod[..m], u, "reconstruction failed: u={u:?} v={v:?}");
+        assert!(is_zero(&prod[m..]));
+        probe
+    }
+
+    /// Adversarial stress test for the D3 correction step, prompted by
+    /// kolja.rs/algorithm-d: for an *odd* base, Knuth's proven bound
+    /// `qhat <= q + 2` fails (three corrections can be needed) and
+    /// implementations that truncate `qhat` to one digit break. Our base
+    /// `2^64` is even, the correction loop is unbounded, and add-back covers
+    /// the residual `q + 1` case, so the bug cannot apply; this test pins all
+    /// of that empirically by hammering the article's worst-case digit
+    /// pattern mapped to base 2^64 (divisor top limb at the normalization
+    /// boundary, next limbs saturated, dividend top equal to the divisor
+    /// top). At the end it asserts every hard path was actually exercised.
+    #[test]
+    fn test_div_knuth_d3_adversarial() {
+        let iters: u64 = if cfg!(debug_assertions) {
+            200_000
+        } else {
+            2_000_000
+        };
+        let mut rng = Rng(0xA160B17D);
+        let specials: [u64; 8] = [
+            1 << 63,
+            (1 << 63) | 1,
+            (1 << 63) - 1, // top bit clear: forces a normalization shift
+            u64::MAX,
+            u64::MAX - 1,
+            (1 << 63) + (1 << 62),
+            1, // maximal normalization shift (s == 63)
+            (u64::MAX >> 1) + 1,
+        ];
+        let mut max_corrections = 0u32;
+        let mut addback_seen = false;
+        let mut eq_estimate_seen = false;
+        let mut s_zero_seen = false;
+        let mut s_shift_seen = false;
+        let mut m_eq_n_seen = false;
+        for iter in 0..iters {
+            let n = 2 + (rng.next() as usize) % 3; // 2..=4 divisor limbs
+            let m = n + (rng.next() as usize) % (6 - n); // n..=5 dividend limbs
+            let mut u = [0u64; 5];
+            let mut v = [0u64; 4];
+            for x in u.iter_mut().take(m) {
+                *x = match rng.next() % 4 {
+                    0 => specials[(rng.next() as usize) % specials.len()],
+                    1 => u64::MAX,
+                    _ => rng.next(),
+                };
+            }
+            for x in v.iter_mut().take(n) {
+                *x = match rng.next() % 4 {
+                    0 => specials[(rng.next() as usize) % specials.len()],
+                    1 => u64::MAX,
+                    _ => rng.next(),
+                };
+            }
+            if v[n - 1] == 0 {
+                v[n - 1] = specials[(rng.next() as usize) % specials.len()];
+            }
+            // Deterministic hammering of the article's digit pattern
+            // (v_{n-1} = b/2, v_{n-2} = b-1, u_top = v_{n-1}, u_next = b-1)
+            // and of the `qhat >= B` estimate path.
+            match iter % 5 {
+                0 => {
+                    v[n - 1] = 1 << 63;
+                    v[n - 2] = u64::MAX;
+                    u[m - 1] = v[n - 1];
+                    u[m - 2] = u64::MAX;
+                }
+                1 => u[m - 1] = v[n - 1],
+                2 => {
+                    v[n - 1] = 1 << 63;
+                    u[m - 1] = (1 << 63) - 1;
+                    u[m - 2] = u64::MAX;
+                }
+                _ => {}
+            }
+
+            let probe = check_div_knuth(&u[..m], &v[..n]);
+            max_corrections = max_corrections.max(probe.max_corrections);
+            addback_seen |= probe.addback;
+            eq_estimate_seen |= probe.eq_estimate;
+            s_zero_seen |= v[n - 1] >= 1 << 63;
+            s_shift_seen |= v[n - 1] < 1 << 63;
+            m_eq_n_seen |= m == n;
+        }
+        // Knuth's bound for an even base: at most two corrections. Both must
+        // be reachable, and every hard path must have been hit at least once.
+        assert_eq!(max_corrections, 2, "expected the 2-correction worst case");
+        assert!(addback_seen, "add-back path never exercised");
+        assert!(eq_estimate_seen, "qhat >= B estimate path never exercised");
+        assert!(s_zero_seen && s_shift_seen, "both normalization paths");
+        assert!(m_eq_n_seen, "m == n (single quotient limb) never exercised");
+    }
+
+    /// Fixed vectors pinning each hard path of algorithm D, so a regression
+    /// in any of them fails deterministically (the adversarial test reaches
+    /// the same paths, but through a PRNG). Vectors were mined from the
+    /// adversarial search; each is asserted to still hit its path.
+    #[test]
+    fn test_div_knuth_hard_path_fixtures() {
+        // Add-back (D6) with an already-normalized divisor (s == 0).
+        let u = [
+            9223372036854775808,
+            8792676872254834457,
+            18446744073709551615,
+            9223372036854775808,
+        ];
+        let v = [
+            14320622906001072715,
+            9223372036854775808,
+            18446744073709551615,
+            9223372036854775808,
+        ];
+        assert!(check_div_knuth(&u, &v).addback, "add-back, s == 0");
+
+        // Add-back (D6) behind a normalization shift (s > 0).
+        let u = [
+            15833662907273503877,
+            1193572382016947486,
+            9223372036854775808,
+            18446744073709551615,
+            9223372036854775807,
+        ];
+        let v = [
+            10296164541181878266,
+            10908281225356688296,
+            18446744073709551615,
+            9223372036854775807,
+        ];
+        assert!(check_div_knuth(&u, &v).addback, "add-back, s > 0");
+
+        // Two D3 corrections: Knuth's worst case for an even base.
+        let u = [
+            10216183818892624758,
+            12442129881179520362,
+            18446744073709551615,
+            9223372036854775808,
+        ];
+        let v = [
+            16550061096035433150,
+            18446744073709551615,
+            9223372036854775808,
+        ];
+        assert_eq!(check_div_knuth(&u, &v).max_corrections, 2, "2 corrections");
+
+        // `un[j+n] == vtop` estimate branch: qhat starts at B or B + 1.
+        let u = [
+            7873722608829012771,
+            1077289598778399907,
+            18446744073709551615,
+        ];
+        let v = [18446744073709551615, 18446744073709551615];
+        assert!(check_div_knuth(&u, &v).eq_estimate, "qhat >= B estimate");
+
+        // Maximal normalization shift (s == 63, divisor top limb is 1).
+        let u = [0x123456789ABCDEF0, u64::MAX, 0xFEDCBA9876543210];
+        let v = [u64::MAX, 1];
+        check_div_knuth(&u, &v);
+
+        // Dividend smaller than divisor at equal width: q == 0, r == u.
+        let u = [7u64, 3];
+        let v = [9u64, u64::MAX];
+        let mut q = [0xAAAA_AAAA_AAAA_AAAAu64; 3];
+        let mut r = [0xAAAA_AAAA_AAAA_AAAAu64; 4];
+        div_knuth(&mut q, &mut r, &u, &v);
+        assert_eq!(q, [0, 0, 0], "quotient and excess limbs zeroed");
+        assert_eq!(r, [7, 3, 0, 0], "remainder and excess limbs zeroed");
+    }
+
+    /// Rounding and overflow edges of [`dec_div`] that random inputs almost
+    /// never reach: the exact tie (`2 * rem == divisor`) through the
+    /// multi-limb compare, the `2 * rem` left-shift carrying out of the
+    /// divisor width, round-up carrying out of an all-ones quotient, and the
+    /// narrow-tier fall-through on 2-limb quotient overflow.
+    #[test]
+    fn test_dec_div_rounding_edges() {
+        let b = 1u64 << 63;
+        // Tie: 7*2^64 / 2*2^64 = 3 rem 2^64, and 2*rem == divisor exactly
+        // (multi-limb cmp_words returns Equal). HalfEven sees an odd
+        // quotient and rounds up; Down truncates.
+        let a2 = [0u64, 7];
+        let b2 = [0u64, 2];
+        let r = dec_div::<0, 2, 3>(false, &a2, false, &b2, Rounding::HalfEven);
+        assert_eq!(r, Some((false, [4, 0])), "tie rounds odd quotient up");
+        let r = dec_div::<0, 2, 3>(false, &a2, false, &b2, Rounding::Down);
+        assert_eq!(r, Some((false, [3, 0])), "tie truncates under Down");
+
+        // 2 * rem overflows the divisor's limb count: divisor top limb has
+        // its top bit set (legal when the divisor is narrower than W), and
+        // rem == 2^127 so the doubling shl1 carries out => "round up".
+        let a4 = [3u64, 0, 2, 0]; // 3 * b + 2^127 with b = 2^127 + 1
+        let b4 = [1u64, b, 0, 0];
+        let r = dec_div::<0, 4, 5>(false, &a4, false, &b4, Rounding::HalfUp);
+        assert_eq!(r, Some((false, [4, 0, 0, 0])), "shl1 carry means rem > b/2");
+        let r = dec_div::<0, 4, 5>(false, &a4, false, &b4, Rounding::Down);
+        assert_eq!(r, Some((false, [3, 0, 0, 0])));
+
+        // Round-up carry out of an all-ones quotient: a * 100 = 9 * (2^128 -
+        // 1) + 5, so q is all ones and 2 * 5 > 9 rounds up, overflowing W
+        // limbs => None (not a wrong wrapped value).
+        let a2 = [8116567392432202711u64, 1660206966633859645];
+        let b2 = [9u64, 0];
+        let r = dec_div::<2, 2, 3>(false, &a2, false, &b2, Rounding::HalfUp);
+        assert_eq!(r, None, "round-up past all-ones quotient overflows");
+        // (Down also overflows: all-ones already exceeds MAX = 2^127 - 1,
+        // caught by the top-bit check instead of the round-up carry.)
+        let r = dec_div::<2, 2, 3>(false, &a2, false, &b2, Rounding::Down);
+        assert_eq!(r, None);
+
+        // Narrow-tier fall-through: 2-limb operands whose quotient has the
+        // top bit set overflow the 2-limb core but fit the 4-limb range.
+        let a4 = [u64::MAX, u64::MAX, 0, 0];
+        let b4 = [1u64, 0, 0, 0];
+        let r = dec_div::<0, 4, 5>(false, &a4, false, &b4, Rounding::Down);
+        assert_eq!(r, Some((false, [u64::MAX, u64::MAX, 0, 0])));
+    }
+
+    /// Overflow edges of [`dec_mul`]: the re-scaled product exceeding W
+    /// limbs, non-HalfUp round-up carrying out of an all-ones magnitude, and
+    /// the single-limb fast path falling through to the wide core when the
+    /// 2-limb result overflows (only possible for DIGITS == 0).
+    #[test]
+    fn test_dec_mul_overflow_edges() {
+        // 2^126 * 4 == 2^128: the product needs a third limb => None.
+        let a2 = [0u64, 1 << 62];
+        let b2 = [4u64, 0];
+        let r = dec_mul::<0, 2, 4>(false, &a2, false, &b2, Rounding::Down);
+        assert_eq!(r, None, "re-scaled product exceeds W limbs");
+
+        // 155 * b == 10 * (2^64 - 1) + 5: quotient all ones, exact tie, odd,
+        // so HalfEven rounds up and the increment carries out => None.
+        let b1 = [(u64::MAX as u128 * 2 + 1).div_euclid(31) as u64]; // (2^65-1)/31
+        let r = dec_mul::<1, 1, 2>(false, &[155], false, &b1, Rounding::HalfEven);
+        assert_eq!(r, None, "round-up past all-ones product overflows");
+        // (Down also overflows: all-ones already exceeds 2^63 - 1, caught by
+        // the top-bit check instead of the round-up carry.)
+        let r = dec_mul::<1, 1, 2>(false, &[155], false, &b1, Rounding::Down);
+        assert_eq!(r, None);
+
+        // Single-limb fast path fall-through: (2^64-1)^2 overflows the
+        // 2-limb symmetric range but fits 4 limbs.
+        let a4 = [u64::MAX, 0, 0, 0];
+        let r = dec_mul::<0, 4, 8>(false, &a4, false, &a4, Rounding::Down);
+        assert_eq!(r, Some((false, [1, u64::MAX - 1, 0, 0])), "(2^64-1)^2");
+    }
+
+    #[test]
+    fn test_div_rem_u128_pow10_edges() {
+        // DIGITS == 0 is the identity.
+        assert_eq!(div_rem_u128_pow10::<0>(12345), (12345, 0));
+        assert_eq!(div_rem_u128_pow10::<0>(u128::MAX), (u128::MAX, 0));
+        // High half >= 10^DIGITS exercises the wide first reduction.
+        let n = (10_000_000u128 << 64) + 123_456_789;
+        assert_eq!(
+            div_rem_u128_pow10::<4>(n),
+            (n / 10_000, (n % 10_000) as u64)
+        );
+        assert_eq!(
+            div_rem_u128_pow10::<19>(u128::MAX),
+            (
+                u128::MAX / POW10_19 as u128,
+                (u128::MAX % POW10_19 as u128) as u64,
+            )
+        );
+    }
+
     #[test]
     fn test_div_knuth_exact_and_edges() {
         // 2^192 / 2^128 == 2^64

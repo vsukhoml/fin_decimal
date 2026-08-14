@@ -205,6 +205,11 @@ fn main() {
             let (a, b) = d_2w[i % PAIRS];
             a % b
         });
+        bench("mul_div (2w*1w)/2w (Knuth)", |i| {
+            let (a, b) = m2x1[i % PAIRS];
+            let (_, c) = d_2w[i % PAIRS];
+            a.mul_div_rounded(b, c, Rounding::HalfUp)
+        });
         bench("round_to HalfEven", |i| {
             let (a, _) = m2x1[i % PAIRS];
             a.round_to(Rounding::HalfEven)
@@ -256,6 +261,11 @@ fn main() {
         bench("div  4w / 4w (Knuth)", |i| {
             let (a, b) = d4[i % PAIRS];
             a / b
+        });
+        bench("mul_div (2w*2w)/3w (Knuth)", |i| {
+            let (a, b) = m2x2[i % PAIRS];
+            let (_, c) = d3[i % PAIRS];
+            a.mul_div_rounded(b, c, Rounding::HalfUp)
         });
         bench("round_to HalfEven", |i| {
             let (a, _) = m4x1[i % PAIRS];

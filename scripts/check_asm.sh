@@ -76,8 +76,14 @@ done
 # 2) Runtime-divisor division: div instructions are fine, builtins are not.
 for fn in probe_amount64_div probe_amount128_div probe_amount256_div \
           probe_amount128_rem probe_amount64_ratio probe_amount128_div_int \
-          probe_amount64_mul_div probe_amount64_sqrt; do
+          probe_amount64_mul_div probe_amount128_mul_div \
+          probe_amount256_mul_div probe_amount64_sqrt; do
     b=$(body "$fn")
+    if [ -z "$b" ]; then
+        report "$fn" "FAIL" "function not found in assembly"
+        fail=1
+        continue
+    fi
     calls=$(printf '%s\n' "$b" | grep -cE 'call.*(udivti3|umodti3|divti3|modti3)' || true)
     divs=$(count "$b" "$DIV_RE")
     if [ "$calls" -eq 0 ]; then

@@ -587,38 +587,69 @@ pub(crate) fn dec_div<const DIGITS: u8, const W: usize, const WP1: usize>(
     let neg = a_neg != b_neg;
     let mut num = [0u64; WP1];
     mul_words(&mut num, a_mag, &[const { upow10(DIGITS as u32) }]);
+    let (rem_cmp, rem_zero) = div_mag_in_place(&mut num, b_mag);
+    round_quotient::<W>(&num, rem_cmp, rem_zero, neg, mode)
+}
 
-    let n = sig_limbs(b_mag);
-    let mut q = [0u64; WP1];
-    let (rem_cmp, rem_zero) = if n == 1 {
-        // Single-limb divisor: word-based long division. For W == 1 this is
-        // the only possible path and the rest folds away.
-        let d = b_mag[0];
-        let rem = div_words_by_word(&mut num, d);
-        q = num;
-        (cmp_twice_rem_u64(rem, d), rem == 0)
+/// Divides `num` in place by the significant limbs of `div` (`num` becomes
+/// the quotient), returning the ordering of `2 * remainder` against the
+/// divisor and whether the remainder was zero — exactly what the rounding
+/// decision needs. The divide-and-classify tail shared by [`dec_div`] and
+/// [`dec_mul_div`]. `div` must be non-zero; single-limb divisors take word
+/// division (through [`div_2by1`], so the `asm` feature applies), wider
+/// ones Knuth's algorithm D over significant limbs only.
+///
+/// `#[inline(always)]`: each caller invokes this exactly once per
+/// monomorphization, and inlining is what lets the slice lengths become
+/// compile-time constants again (without it, every width shares one
+/// dynamic-length body and the division paths measurably regress).
+#[inline(always)]
+fn div_mag_in_place(num: &mut [u64], div: &[u64]) -> (Ordering, bool) {
+    let n = sig_limbs(div);
+    if n == 1 {
+        // Single-limb divisor: word-based long division. For 1-limb callers
+        // this is the only possible path and the rest folds away.
+        let d = div[0];
+        let rem = div_words_by_word(num, d);
+        return (cmp_twice_rem_u64(rem, d), rem == 0);
+    }
+    let mut q = [0u64; KNUTH_MAX_M];
+    let mut r = [0u64; KNUTH_MAX_M];
+    let m = sig_limbs(num);
+    if m < n {
+        // Fewer dividend limbs than divisor limbs: quotient is zero and the
+        // whole dividend is the remainder.
+        r[..m].copy_from_slice(&num[..m]);
+        num[..m].fill(0);
     } else {
-        let mut r = [0u64; W];
-        let m = sig_limbs(&num);
-        if m < n {
-            // Fewer numerator limbs than divisor limbs: quotient is zero and
-            // the whole numerator is the remainder.
-            r[..m].copy_from_slice(&num[..m]);
-        } else {
-            div_knuth(&mut q[..m - n + 1], &mut r[..n], &num[..m], &b_mag[..n]);
-        }
-        // Order 2 * rem against the divisor.
-        let mut r2 = [0u64; W];
-        r2[..n].copy_from_slice(&r[..n]);
-        let carry = shl1(&mut r2[..n]);
-        let cmp = if carry != 0 {
-            Ordering::Greater
-        } else {
-            cmp_words(&r2[..n], &b_mag[..n])
-        };
-        (cmp, is_zero(&r[..n]))
+        div_knuth(&mut q[..m - n + 1], &mut r[..n], &num[..m], &div[..n]);
+        num.copy_from_slice(&q[..num.len()]);
+    }
+    // Order 2 * rem against the divisor: doubling in place is safe because
+    // the zero test happens first.
+    let rem_zero = is_zero(&r[..n]);
+    let carry = shl1(&mut r[..n]);
+    let cmp = if carry != 0 {
+        Ordering::Greater
+    } else {
+        cmp_words(&r[..n], &div[..n])
     };
-    if q[W] != 0 {
+    (cmp, rem_zero)
+}
+
+/// Applies the rounding decision to a quotient's low `W` limbs and runs the
+/// symmetric-range checks shared by [`dec_div`] and [`dec_mul_div`]: `None`
+/// if the quotient needs more than `W` limbs, if rounding up carries out of
+/// them, or if the result's top bit is set.
+#[inline]
+fn round_quotient<const W: usize>(
+    q: &[u64],
+    rem_cmp: Ordering,
+    rem_zero: bool,
+    neg: bool,
+    mode: Rounding,
+) -> Option<(bool, [u64; W])> {
+    if !is_zero(q.split_at(W).1) {
         return None;
     }
     let mut mag = [0u64; W];
@@ -632,6 +663,60 @@ pub(crate) fn dec_div<const DIGITS: u8, const W: usize, const WP1: usize>(
         return None;
     }
     Some((neg, mag))
+}
+
+/// `a * b / c` on the exact double-width product with a single rounding at
+/// the end: the width-generic muldiv core shared by [`Decimal128`](crate::
+/// Decimal128) and [`Decimal256`](crate::Decimal256). `W2` must equal
+/// `2 * W`. The `b / c` scale cancels at the call site, so unlike
+/// [`dec_div`] there is no re-scaling by 10^DIGITS: the dividend is the
+/// plain 2W-limb product (which is why `KNUTH_MAX_M` is 2W for the widest
+/// backing). Single-limb divisors take word division (through [`div_2by1`],
+/// so the `asm` feature applies); wider divisors take Knuth's algorithm D
+/// over significant limbs only.
+///
+/// Returns `None` if `c` is zero or the result overflows the symmetric
+/// range.
+#[inline]
+pub(crate) fn dec_mul_div<const W: usize, const W2: usize>(
+    a_neg: bool,
+    a_mag: &[u64; W],
+    b_neg: bool,
+    b_mag: &[u64; W],
+    c_neg: bool,
+    c_mag: &[u64; W],
+    mode: Rounding,
+) -> Option<(bool, [u64; W])> {
+    debug_assert!(W2 == 2 * W);
+    if is_zero(c_mag) {
+        return None;
+    }
+    // Same narrow-operand tiering as dec_mul/dec_div; `c` is known non-zero
+    // here, so `None` from the narrow core only means quotient overflow:
+    // fall through and recompute wide.
+    if W > 2
+        && is_zero(a_mag.split_at(2).1)
+        && is_zero(b_mag.split_at(2).1)
+        && is_zero(c_mag.split_at(2).1)
+    {
+        let a2 = [a_mag[0], a_mag[1]];
+        let b2 = [b_mag[0], b_mag[1]];
+        let c2 = [c_mag[0], c_mag[1]];
+        if let Some((n2, m2)) = dec_mul_div::<2, 4>(a_neg, &a2, b_neg, &b2, c_neg, &c2, mode) {
+            let mut mag = [0u64; W];
+            mag[0] = m2[0];
+            mag[1] = m2[1];
+            return Some((n2, mag));
+        }
+    }
+    let neg = (a_neg != b_neg) != c_neg;
+    // Full-width fixed-length product on purpose: bounding the slices by
+    // sig_limbs was measured slower (dynamic lengths defeat unrolling, and
+    // the division below already skips leading zero limbs via sig_limbs).
+    let mut prod = [0u64; W2];
+    mul_words(&mut prod, a_mag, b_mag);
+    let (rem_cmp, rem_zero) = div_mag_in_place(&mut prod, c_mag);
+    round_quotient::<W>(&prod, rem_cmp, rem_zero, neg, mode)
 }
 
 /// Decides whether a truncated magnitude should be rounded up (away from the

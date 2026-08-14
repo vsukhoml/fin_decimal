@@ -848,10 +848,40 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
             .map(|(neg, mag)| Decimal::<DIGITS>(i64_from_sign_mag(neg, mag)))
     }
 
+    /// Checked remainder. Computes `self % rhs`, returning `None` if
+    /// `rhs == 0`. (The remainder itself cannot overflow: its magnitude
+    /// never exceeds the divisor's.)
+    #[inline]
+    pub const fn checked_rem(self, rhs: Self) -> Option<Self> {
+        if rhs.0 == 0 {
+            None
+        } else {
+            Some(Decimal::<DIGITS>(self.0 % rhs.0))
+        }
+    }
+
     /// Takes the reciprocal (inverse) of a number, 1/x.
+    ///
+    /// # Panics
+    /// Panics if `self` is zero (like core's `/`) or the result overflows;
+    /// [`checked_recip`](Self::checked_recip) is the non-panicking form.
     #[inline]
     pub fn recip(self) -> Self {
-        Self::ONE.div_rounded(self, Rounding::HalfUp)
+        if self.0 == 0 {
+            panic!("attempt to divide by zero");
+        }
+        match self.checked_recip() {
+            Some(v) => v,
+            None => panic!("attempt to divide with overflow"),
+        }
+    }
+
+    /// Checked reciprocal: `None` if `self` is zero or `1 / self` overflows
+    /// (on this backing the reciprocal's mantissa can reach
+    /// `10^(2 * DIGITS)`, which exceeds the range for `DIGITS >= 10`).
+    #[inline]
+    pub fn checked_recip(self) -> Option<Self> {
+        Self::ONE.checked_div_rounded(self, Rounding::HalfUp)
     }
 
     /// Returns the integer part of a number.
@@ -887,14 +917,13 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// assert_eq!(g.floor(), 3);
     /// assert_eq!(h.floor(), -4);
     /// ```
-    pub fn floor(self) -> Self {
-        let frac = self.0 % Self::SCALE_INT;
-
-        if self.0 < 0 && frac != 0 {
-            Decimal::<DIGITS>(self.0 - frac - Self::SCALE_INT)
-        } else {
-            Decimal::<DIGITS>(self.0 - frac)
-        }
+    ///
+    /// # Panics
+    /// Panics if rounding at the very edge of the range overflows (see
+    /// [`round_to`](Self::round_to)).
+    #[inline]
+    pub const fn floor(self) -> Self {
+        self.round_to(Rounding::Down)
     }
 
     /// Returns the smallest integer greater than or equal to a number.
@@ -911,18 +940,13 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// assert_eq!(g.ceil(), 4);
     /// assert_eq!(h.ceil(), -3);
     /// ```
-    pub fn ceil(self) -> Self {
-        let mut frac = self.0 % Self::SCALE_INT;
-        if frac != 0 {
-            // For negatives, ceiling is truncation: dropping the (negative)
-            // fraction already moves toward +inf.
-            if self.0 > 0 {
-                frac -= Self::SCALE_INT
-            }
-            Decimal::<DIGITS>(self.0 - frac)
-        } else {
-            self
-        }
+    ///
+    /// # Panics
+    /// Panics if rounding at the very edge of the range overflows (see
+    /// [`round_to`](Self::round_to)).
+    #[inline]
+    pub const fn ceil(self) -> Self {
+        self.round_to(Rounding::Up)
     }
 
     /// Returns the nearest integer to a number. Round half-way cases away from
@@ -938,17 +962,13 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// assert_eq!(f.round(), 3);
     /// assert_eq!(g.round(), -3);
     /// ```
-    pub fn round(self) -> Self {
-        let mut frac = self.0 % Self::SCALE_INT;
-
-        // check if rounding is needed
-        if frac >= Self::SCALE_INT_HALF {
-            frac -= Self::SCALE_INT
-        } else if frac <= -Self::SCALE_INT_HALF {
-            frac += Self::SCALE_INT
-        }
-
-        Decimal::<DIGITS>(self.0 - frac)
+    ///
+    /// # Panics
+    /// Panics if rounding at the very edge of the range overflows (see
+    /// [`round_to`](Self::round_to)).
+    #[inline]
+    pub const fn round(self) -> Self {
+        self.round_to(Rounding::HalfUp)
     }
 
     /// Rounding to 1/100th (0.01) half-way cases away from `0.0`.
@@ -960,7 +980,11 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// assert_eq!(Amount64::from(3.356_f64).round100(), Amount64::from(3.36_f64));
     /// assert_eq!(Amount64::from(3.354_f64).round100(), Amount64::from(3.35_f64));
     /// ```
-    pub fn round100(self) -> Self {
+    ///
+    /// # Panics
+    /// Panics if rounding away from zero at the very edge of the range
+    /// overflows.
+    pub const fn round100(self) -> Self {
         let mut frac = self.0 % Self::SCALE_INT_100;
 
         // check if rounding is needed
@@ -969,14 +993,32 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         } else if frac <= -Self::SCALE_INT_HALF_100 {
             frac += Self::SCALE_INT_100
         }
-        Decimal::<DIGITS>(self.0 - frac)
+        // Checked: must panic, not wrap, under the consumer's release
+        // profile (see round_to).
+        match self.0.checked_sub(frac) {
+            Some(v) => Decimal::<DIGITS>(v),
+            None => panic!("attempt to round with overflow"),
+        }
     }
 
     /// Explicitly rounds the value using the specified rounding mode.
+    ///
+    /// # Panics
+    /// Panics if rounding away from zero at the very edge of the range
+    /// overflows.
     pub const fn round_to(self, mode: Rounding) -> Self {
+        match self.checked_round_to(mode) {
+            Some(v) => v,
+            None => panic!("attempt to round with overflow"),
+        }
+    }
+
+    /// Checked form of [`round_to`](Self::round_to): `None` if rounding away
+    /// from zero at the very edge of the range overflows.
+    pub const fn checked_round_to(self, mode: Rounding) -> Option<Self> {
         let frac = self.0 % Decimal::<DIGITS>::SCALE_INT;
         if frac == 0 {
-            return self;
+            return Some(self);
         }
 
         let int_part = self.0 - frac;
@@ -1029,14 +1071,21 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
             }
         }
 
-        let mut res = int_part;
-        if add_one {
-            res += Decimal::<DIGITS>::SCALE_INT;
+        // Checked: rounding away from zero at the very edge of the range
+        // must be caught in every build profile, never wrap in release
+        // builds of consumer crates (this generic body is monomorphized
+        // under the consumer's overflow-checks setting).
+        let step = if add_one {
+            Decimal::<DIGITS>::SCALE_INT
+        } else if sub_one {
+            -Decimal::<DIGITS>::SCALE_INT
+        } else {
+            0
+        };
+        match int_part.checked_add(step) {
+            Some(res) => Some(Decimal::<DIGITS>(res)),
+            None => None,
         }
-        if sub_one {
-            res -= Decimal::<DIGITS>::SCALE_INT;
-        }
-        Decimal::<DIGITS>(res)
     }
 
     /// Multiply by another decimal, explicitly applying the given rounding mode.
@@ -1316,28 +1365,11 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         c: Decimal<S>,
         mode: Rounding,
     ) -> Option<Self> {
-        if c.0 == 0 {
-            return None;
-        }
-        let neg = ((self.0 < 0) != (b.0 < 0)) != (c.0 < 0);
-        let num = self.0.unsigned_abs() as u128 * b.0.unsigned_abs() as u128;
-        let d = c.0.unsigned_abs();
-        let mut mag = [num as u64, (num >> 64) as u64];
-        let r = limbs::div_words_by_word(&mut mag, d);
-        if limbs::round_up_by_cmp(
-            limbs::cmp_twice_rem_u64(r, d),
-            r == 0,
-            mag[0] & 1 != 0,
-            neg,
-            mode,
-        ) && limbs::mul_add_word(&mut mag, 1, 1)
-        {
-            return None;
-        }
-        if mag[1] != 0 || mag[0] >> 63 != 0 {
-            return None;
-        }
-        Some(Decimal::<DIGITS>(i64_from_sign_mag(neg, [mag[0]])))
+        let (an, am) = i64_sign_mag(self.0);
+        let (bn, bm) = i64_sign_mag(b.0);
+        let (cn, cm) = i64_sign_mag(c.0);
+        limbs::dec_mul_div::<1, 2>(an, &am, bn, &bm, cn, &cm, mode)
+            .map(|(neg, mag)| Decimal::<DIGITS>(i64_from_sign_mag(neg, mag)))
     }
 
     /// `self * b / c` on the exact 128-bit product with a single rounding at
@@ -1366,9 +1398,10 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         if c.0 == 0 {
             panic!("attempt to divide by zero");
         }
+        // The 2W-limb product is exact, so overflow is always quotient-driven.
         match self.checked_mul_div_rounded(b, c, mode) {
             Some(v) => v,
-            None => panic!("attempt to multiply with overflow"),
+            None => panic!("attempt to divide with overflow"),
         }
     }
 
@@ -1605,26 +1638,46 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     ///
     /// assert!(abs_difference < 1e-10);
     /// ```
-    pub const fn powi(self, mut exp: u32) -> Self {
+    ///
+    /// # Panics
+    /// Panics if an intermediate product overflows;
+    /// [`checked_powi`](Self::checked_powi) is the non-panicking form.
+    #[inline]
+    pub const fn powi(self, exp: u32) -> Self {
+        match self.checked_powi(exp) {
+            Some(v) => v,
+            None => panic!("attempt to multiply with overflow"),
+        }
+    }
+
+    /// Checked form of [`powi`](Self::powi): `None` if an intermediate
+    /// product overflows. Each step rounds `HalfUp` at the type's scale,
+    /// like `powi`.
+    pub const fn checked_powi(self, mut exp: u32) -> Option<Self> {
         let mut base = self;
         let mut acc = Self::ONE;
-
         while exp > 1 {
             if (exp & 1) == 1 {
-                acc = base.mul_rounded(acc, Rounding::HalfUp);
+                acc = match base.checked_mul_rounded(acc, Rounding::HalfUp) {
+                    Some(v) => v,
+                    None => return None,
+                };
             }
             exp /= 2;
-            base = base.mul_rounded(base, Rounding::HalfUp);
+            base = match base.checked_mul_rounded(base, Rounding::HalfUp) {
+                Some(v) => v,
+                None => return None,
+            };
         }
-
-        // Deal with the final bit of the exponent separately, since
-        // squaring the base afterwards is not necessary and may cause a
-        // needless overflow.
+        // The final bit of the exponent is handled separately: squaring the
+        // base afterwards is unnecessary and could overflow needlessly.
         if exp == 1 {
-            acc = base.mul_rounded(acc, Rounding::HalfUp);
+            acc = match base.checked_mul_rounded(acc, Rounding::HalfUp) {
+                Some(v) => v,
+                None => return None,
+            };
         }
-
-        acc
+        Some(acc)
     }
 
     //pub const fn div_euclid(self, rhs: Self) -> Self {
@@ -1919,9 +1972,15 @@ impl<const DIGITS: u8> Div for Decimal<DIGITS> {
 impl<const DIGITS: u8> Rem for Decimal<DIGITS> {
     type Output = Self;
 
+    /// # Panics
+    /// Panics if `rhs` is zero;
+    /// [`checked_rem`](Decimal::checked_rem) is the non-panicking form.
     #[inline]
     fn rem(self, rhs: Self) -> Self {
-        Decimal::<DIGITS>(self.0 % rhs.0)
+        match self.checked_rem(rhs) {
+            Some(v) => v,
+            None => panic!("attempt to calculate the remainder with a divisor of zero"),
+        }
     }
 }
 
@@ -2512,6 +2571,15 @@ mod tests {
         const DOUBLED: Option<Amount64> = PRICE.checked_mul(Amount64::from_str_const("2"));
         const GROWTH: Amount64 = Amount64::from_str_const("1.05").powi(10);
         const ROUNDED: Amount64 = TAX.round_to(Rounding::HalfUp);
+        // ceil/floor/round are const via round_to; pin the negative-operand
+        // ceiling (truncation toward +inf) under CTFE.
+        const CEIL_NEG: Amount64 = Amount64::from_str_const("-3.25").ceil();
+        const FLOOR_NEG: Amount64 = Amount64::from_str_const("-3.25").floor();
+        // The checked forms are const too; overflow yields None under CTFE
+        // instead of a compile error.
+        const REM: Option<Amount64> = PRICE.checked_rem(Amount64::from_str_const("3"));
+        const POW_OVER: Option<Amount64> = Amount64::MAX.checked_powi(2);
+        const RND_OVER: Option<Amount64> = Amount64::MAX.checked_round_to(Rounding::Up);
         // Cross-scale multiply (4-digit amount x 8-digit rate) and integer
         // division both evaluate at compile time.
         const FEE: Amount64 = PRICE.mul_rounded(Rate64::from_str_const("0.0725"), Rounding::HalfUp);
@@ -2528,6 +2596,11 @@ mod tests {
         assert_eq!(DOUBLED, price.checked_mul(Amount64::from(2)));
         assert_eq!(GROWTH, Amount64::from_str("1.05").unwrap().powi(10));
         assert_eq!(ROUNDED, TAX.round_to(Rounding::HalfUp));
+        assert_eq!(CEIL_NEG, Amount64::from(-3));
+        assert_eq!(FLOOR_NEG, Amount64::from(-4));
+        assert_eq!(REM, Some(Amount64::from_str_const("1.99")));
+        assert_eq!(POW_OVER, None);
+        assert_eq!(RND_OVER, None);
         assert_eq!(
             FEE,
             price.mul_rounded(Rate64::from_str("0.0725").unwrap(), Rounding::HalfUp)
@@ -3087,6 +3160,81 @@ mod tests {
     }
 
     #[test]
+    fn test_checked_rem_powi_recip_round_to() {
+        use crate::Rounding::*;
+        let a = Amount64::from_str_const("7.5");
+        let b = Amount64::from(2);
+        assert_eq!(a.checked_rem(b), Some(Amount64::from_str_const("1.5")));
+        assert_eq!(a.checked_rem(Amount64::ZERO), None);
+
+        assert_eq!(b.checked_powi(0), Some(Amount64::ONE));
+        assert_eq!(b.checked_powi(1), Some(b));
+        assert_eq!(b.checked_powi(10), Some(Amount64::from(1024)));
+        assert_eq!(Amount64::MAX.checked_powi(2), None);
+        // x^2 fits but x^3 does not: exp = 3 overflows at the final odd-bit
+        // multiply, exp = 7 at the in-loop odd-bit multiply.
+        let big = Amount64::from(100_000);
+        assert_eq!(big.checked_powi(3), None);
+        assert_eq!(big.checked_powi(7), None);
+
+        assert_eq!(b.checked_recip(), Some(Amount64::from_str_const("0.5")));
+        assert_eq!(Amount64::ZERO.checked_recip(), None);
+        // At DIGITS = 10 the reciprocal of the smallest positive value needs
+        // mantissa 10^20 > i64::MAX: the overflow arm of checked_recip.
+        assert_eq!(Decimal::<10>::from_bits(1).checked_recip(), None);
+
+        assert_eq!(a.checked_round_to(Down), Some(Amount64::from(7)));
+        assert_eq!(Amount64::MAX.checked_round_to(Up), None);
+        assert_eq!(Amount64::MIN.checked_round_to(Down), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to calculate the remainder")]
+    fn test_rem_by_zero_panics() {
+        let _ = Amount64::from(1) % Amount64::ZERO;
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to multiply with overflow")]
+    fn test_powi_overflow_panics() {
+        let _ = Amount64::MAX.powi(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_recip_zero_panics() {
+        let _ = Amount64::ZERO.recip();
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide with overflow")]
+    fn test_recip_overflow_panics() {
+        let _ = Decimal::<10>::from_bits(1).recip();
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to round with overflow")]
+    fn test_round100_edge_overflow_panics() {
+        // At scale 3 the fraction of MAX is 7/10 >= 1/2, so rounding to
+        // 1/100 steps past the range.
+        let _ = Decimal::<3>::MAX.round100();
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to round with overflow")]
+    fn test_ceil_edge_overflow_panics() {
+        // MAX has a non-zero fraction, so ceiling steps past the range; this
+        // must panic in every build profile, never wrap.
+        let _ = Amount64::MAX.ceil();
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to round with overflow")]
+    fn test_floor_edge_overflow_panics() {
+        let _ = Amount64::MIN.floor();
+    }
+
+    #[test]
     fn test_f64_eq_uses_type_scale() {
         // Regression: `f64 == Decimal<DIGITS>` once hardcoded Amount64's
         // scale, so it was wrong for any other DIGITS.
@@ -3155,7 +3303,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "attempt to multiply with overflow")]
+    #[should_panic(expected = "attempt to divide with overflow")]
     fn test_mul_div_rounded_overflow_panics() {
         let _ =
             Amount64::MAX.mul_div_rounded(Amount64::from(2), Amount64::from(1), Rounding::HalfUp);

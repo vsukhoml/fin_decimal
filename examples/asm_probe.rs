@@ -135,6 +135,18 @@ pub fn probe_amount64_mul_div(a: Amount64, b: Amount64, c: Amount64) -> Amount64
     a.mul_div_rounded(b, c, Rounding::HalfUp)
 }
 
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount128_mul_div(a: Amount128, b: Amount128, c: Amount128) -> Amount128 {
+    a.mul_div_rounded(b, c, Rounding::HalfUp)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount256_mul_div(a: Amount256, b: Amount256, c: Amount256) -> Amount256 {
+    a.mul_div_rounded(b, c, Rounding::HalfUp)
+}
+
 fn main() {
     // Call every probe so all of them are codegen'd.
     let a64 = black_box(Amount64::from(3));
@@ -168,4 +180,6 @@ fn main() {
     );
     println!("{}", black_box(probe_amount64_sqrt(a64)));
     println!("{}", black_box(probe_amount64_mul_div(a64, b64, b64)));
+    println!("{}", black_box(probe_amount128_mul_div(a128, b128, b128)));
+    println!("{}", black_box(probe_amount256_mul_div(a256, b256, b256)));
 }

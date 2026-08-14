@@ -11,8 +11,9 @@ use crate::AmountErrorKind;
 use crate::AmountSign;
 use crate::Rounding;
 use crate::limbs::{
-    cmp_twice_rem_u64, dec_div, dec_mul, div_knuth, div_words_by_pow10, div_words_by_word,
-    mul_add_word, parse_decimal_mag_rounded, round_up_by_cmp, sig_limbs, str_mag, upow10,
+    cmp_twice_rem_u64, dec_div, dec_mul, dec_mul_div, div_knuth, div_words_by_pow10,
+    div_words_by_word, mul_add_word, parse_decimal_mag_rounded, round_up_by_cmp, sig_limbs,
+    str_mag, upow10,
 };
 use core::cmp::Ordering;
 use core::fmt;
@@ -447,10 +448,40 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
             .map(|(neg, mag)| Decimal256::<DIGITS>(I256::from_sign_mag(neg, mag).unwrap()))
     }
 
+    /// Checked remainder. Computes `self % rhs`, returning `None` if
+    /// `rhs == 0`. (The remainder itself cannot overflow: its magnitude
+    /// never exceeds the divisor's.)
+    #[inline]
+    pub fn checked_rem(self, rhs: Self) -> Option<Self> {
+        if rhs.0.is_zero() {
+            None
+        } else {
+            Some(Decimal256::<DIGITS>(i256_rem(self.0, rhs.0)))
+        }
+    }
+
     /// Takes the reciprocal (inverse) of a number, 1/x.
     #[inline]
+    ///
+    /// # Panics
+    /// Panics if `self` is zero (like core's `/`);
+    /// [`checked_recip`](Self::checked_recip) is the non-panicking form.
     pub fn recip(self) -> Self {
-        Self::ONE / self
+        match self.checked_recip() {
+            Some(v) => v,
+            // `checked_recip` can only fail for zero on this backing: the
+            // reciprocal's mantissa is at most 10^(2 * DIGITS) <= 10^38,
+            // inside the range.
+            None => panic!("attempt to divide by zero"),
+        }
+    }
+
+    /// Checked reciprocal: `None` if `self` is zero. (The result cannot
+    /// overflow on this backing: its mantissa is at most
+    /// `10^(2 * DIGITS) <= 10^38`, well inside the 256-bit range.)
+    #[inline]
+    pub fn checked_recip(self) -> Option<Self> {
+        Self::ONE.checked_div(self)
     }
 
     /// Returns the integer part of a number (rounding toward zero).
@@ -525,11 +556,20 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
     /// # Panics
     /// Panics if rounding up at the very edge of the range overflows.
     pub const fn round_to(self, mode: Rounding) -> Self {
+        match self.checked_round_to(mode) {
+            Some(v) => v,
+            None => panic!("attempt to round with overflow"),
+        }
+    }
+
+    /// Checked form of [`round_to`](Self::round_to): `None` if rounding away
+    /// from zero at the very edge of the range overflows.
+    pub const fn checked_round_to(self, mode: Rounding) -> Option<Self> {
         let (neg, mag) = self.0.to_sign_mag();
         let mut q = mag;
         let rem = div_words_by_pow10::<DIGITS>(&mut q);
         if rem == 0 {
-            return self;
+            return Some(self);
         }
         if round_up_by_cmp(
             cmp_twice_rem_u64(rem, Self::SCALE_U64),
@@ -542,8 +582,8 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
         }
         let overflow = mul_add_word(&mut q, Self::SCALE_U64, 0);
         match (overflow, I256::from_sign_mag(neg, q)) {
-            (false, Some(v)) => Decimal256::<DIGITS>(v),
-            _ => panic!("attempt to round with overflow"),
+            (false, Some(v)) => Some(Decimal256::<DIGITS>(v)),
+            _ => None,
         }
     }
 
@@ -684,6 +724,65 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
         }
     }
 
+    /// `self * b / c` on the exact 512-bit product with a single rounding at
+    /// the end, or `None` if `c` is zero or the result overflows.
+    ///
+    /// The muldiv/pro-rata primitive: allocating an amount by the proportion
+    /// `b / c` this way avoids the double rounding of first taking the ratio
+    /// and then multiplying by it. `b` and `c` share a scale — any scale,
+    /// since it cancels in `b / c` — and the result keeps `self`'s scale.
+    pub fn checked_mul_div_rounded<const S: u8>(
+        self,
+        b: Decimal256<S>,
+        c: Decimal256<S>,
+        mode: Rounding,
+    ) -> Option<Self> {
+        let (an, am) = self.0.to_sign_mag();
+        let (bn, bm) = b.0.to_sign_mag();
+        let (cn, cm) = c.0.to_sign_mag();
+        match dec_mul_div::<4, 8>(an, &am, bn, &bm, cn, &cm, mode) {
+            // The core's top-bit check guarantees the rebuild fits.
+            Some((neg, mag)) => match I256::from_sign_mag(neg, mag) {
+                Some(v) => Some(Decimal256::<DIGITS>(v)),
+                None => unreachable!(),
+            },
+            None => None,
+        }
+    }
+
+    /// `self * b / c` on the exact 512-bit product with a single rounding at
+    /// the end. See
+    /// [`checked_mul_div_rounded`](Self::checked_mul_div_rounded).
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::{Amount256, Rounding};
+    /// // Allocate a total pro rata by 1/3 without an intermediate rate.
+    /// let total = Amount256::from_str_const("100.00");
+    /// let share = total.mul_div_rounded(Amount256::from(1), Amount256::from(3), Rounding::HalfUp);
+    /// assert_eq!(share, Amount256::from_str_const("33.3333"));
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if `c` is zero (like core's `/`) or the result overflows;
+    /// [`checked_mul_div_rounded`](Self::checked_mul_div_rounded) is the
+    /// non-panicking form.
+    pub fn mul_div_rounded<const S: u8>(
+        self,
+        b: Decimal256<S>,
+        c: Decimal256<S>,
+        mode: Rounding,
+    ) -> Self {
+        if c.0.is_zero() {
+            panic!("attempt to divide by zero");
+        }
+        // The 2W-limb product is exact, so overflow is always quotient-driven.
+        match self.checked_mul_div_rounded(b, c, mode) {
+            Some(v) => v,
+            None => panic!("attempt to divide with overflow"),
+        }
+    }
+
     /// Returns `true` if `self` is positive and `false` if the number is zero or negative.
     #[inline]
     pub const fn is_positive(self) -> bool {
@@ -733,20 +832,46 @@ impl<const DIGITS: u8> Decimal256<DIGITS> {
     }
 
     /// Raises a number to an integer power. Usable in const contexts.
-    pub const fn powi(self, mut exp: u32) -> Self {
+    ///
+    /// # Panics
+    /// Panics if an intermediate product overflows;
+    /// [`checked_powi`](Self::checked_powi) is the non-panicking form.
+    #[inline]
+    pub const fn powi(self, exp: u32) -> Self {
+        match self.checked_powi(exp) {
+            Some(v) => v,
+            None => panic!("attempt to multiply with overflow"),
+        }
+    }
+
+    /// Checked form of [`powi`](Self::powi): `None` if an intermediate
+    /// product overflows. Each step rounds `HalfUp` at the type's scale,
+    /// like `powi`.
+    pub const fn checked_powi(self, mut exp: u32) -> Option<Self> {
         let mut base = self;
         let mut acc = Self::ONE;
         while exp > 1 {
             if (exp & 1) == 1 {
-                acc = base.mul_rounded(acc, Rounding::HalfUp);
+                acc = match base.checked_mul_rounded(acc, Rounding::HalfUp) {
+                    Some(v) => v,
+                    None => return None,
+                };
             }
             exp /= 2;
-            base = base.mul_rounded(base, Rounding::HalfUp);
+            base = match base.checked_mul_rounded(base, Rounding::HalfUp) {
+                Some(v) => v,
+                None => return None,
+            };
         }
+        // The final bit of the exponent is handled separately: squaring the
+        // base afterwards is unnecessary and could overflow needlessly.
         if exp == 1 {
-            acc = base.mul_rounded(acc, Rounding::HalfUp);
+            acc = match base.checked_mul_rounded(acc, Rounding::HalfUp) {
+                Some(v) => v,
+                None => return None,
+            };
         }
-        acc
+        Some(acc)
     }
 
     /// Restrict a value to a certain interval.
@@ -947,10 +1072,10 @@ impl<const DIGITS: u8> Rem for Decimal256<DIGITS> {
     /// Panics if `rhs` is zero.
     #[inline]
     fn rem(self, rhs: Self) -> Self {
-        if rhs.0.is_zero() {
-            panic!("attempt to calculate the remainder with a divisor of zero");
+        match self.checked_rem(rhs) {
+            Some(v) => v,
+            None => panic!("attempt to calculate the remainder with a divisor of zero"),
         }
-        Decimal256::<DIGITS>(i256_rem(self.0, rhs.0))
     }
 }
 
@@ -1312,6 +1437,119 @@ mod tests {
     }
 
     #[test]
+    fn test_mul_div_rounded() {
+        use crate::Rounding::*;
+        let one = Amount256::from(1);
+        let two = Amount256::from(2);
+
+        // The product needs limbs beyond i128's muldiv: 10^60 * 10^10 / 10^25
+        // has a 10^78 product mantissa and a two-limb divisor (Knuth path).
+        let a = Amount256::from(10i128.pow(30)) * Amount256::from(10i128.pow(30));
+        let b = Amount256::from(10i128.pow(10));
+        let c = Amount256::from(10i128.pow(25));
+        assert_eq!(
+            a.mul_div_rounded(b, c, HalfUp),
+            Amount256::from(10i128.pow(30)) * Amount256::from(10i128.pow(15))
+        );
+
+        // Narrow-tier fall-through: two-limb operands whose doubled mantissa
+        // needs a third limb overflow the 2-limb core but fit 4 limbs.
+        let wide = Amount256::from_str_const("34028236692093846346337460743176821.1455");
+        assert_eq!(wide.mul_div_rounded(two, one, HalfUp), wide + wide);
+
+        // Product narrower than the divisor: quotient 0, remainder rounds.
+        assert_eq!(one.mul_div_rounded(one, c, Down), Amount256::ZERO);
+        assert_eq!(
+            one.mul_div_rounded(one, c, Up),
+            Amount256::from_str_const("0.0001")
+        );
+
+        // Exact tie: 0.0007 * 1 / 2 = 0.00035; quotient mantissa 3 is odd.
+        let t = Amount256::from_str_const("0.0007");
+        let p3 = Amount256::from_str_const("0.0003");
+        let p4 = Amount256::from_str_const("0.0004");
+        assert_eq!(t.mul_div_rounded(one, two, HalfUp), p4);
+        assert_eq!(t.mul_div_rounded(one, two, HalfEven), p4);
+        assert_eq!(t.mul_div_rounded(one, two, HalfDown), p3);
+        assert_eq!(t.mul_div_rounded(one, two, Down), p3);
+        assert_eq!(t.mul_div_rounded(one, two, Up), p4);
+        // Down is directional (floor): a negative -0.00035 floors to -0.0004.
+        assert_eq!((-t).mul_div_rounded(one, two, Down), -p4);
+        assert_eq!(t.mul_div_rounded(-one, two, Down), -p4);
+        assert_eq!((-t).mul_div_rounded(-one, two, Down), p3);
+        assert_eq!((-t).mul_div_rounded(one, two, Up), -p3);
+
+        // Checked form: zero divisor and overflow both yield None.
+        assert_eq!(
+            t.checked_mul_div_rounded(one, Amount256::ZERO, HalfUp),
+            None
+        );
+        assert_eq!(
+            Amount256::MAX.checked_mul_div_rounded(two, one, HalfUp),
+            None
+        );
+    }
+
+    #[test]
+    fn test_checked_rem_powi_recip_round_to() {
+        use crate::Rounding::*;
+        let a = Amount256::from_str_const("7.5");
+        let b = Amount256::from(2);
+        assert_eq!(a.checked_rem(b), Some(Amount256::from_str_const("1.5")));
+        assert_eq!(a.checked_rem(Amount256::ZERO), None);
+
+        assert_eq!(b.checked_powi(10), Some(Amount256::from(1024)));
+        assert_eq!(Amount256::MAX.checked_powi(2), None);
+        // x^2 fits but x^3 does not: exp = 3 overflows at the final odd-bit
+        // multiply, exp = 7 at the in-loop odd-bit multiply.
+        let big = Amount256::from(10i128.pow(30));
+        assert_eq!(big.checked_powi(3), None);
+        assert_eq!(big.checked_powi(7), None);
+
+        assert_eq!(b.checked_recip(), Some(Amount256::from_str_const("0.5")));
+        assert_eq!(Amount256::ZERO.checked_recip(), None);
+        assert_eq!(
+            Amount256::from_str_const("0.0001").checked_recip(),
+            Some(Amount256::from(10000))
+        );
+
+        assert_eq!(a.checked_round_to(Down), Some(Amount256::from(7)));
+        assert_eq!(Amount256::MAX.checked_round_to(Up), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to multiply with overflow")]
+    fn test_powi_overflow_panics() {
+        let _ = Amount256::MAX.powi(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_recip_zero_panics() {
+        let _ = Amount256::ZERO.recip();
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_mul_div_rounded_by_zero() {
+        let _ = Amount256::from(1).mul_div_rounded(
+            Amount256::from(1),
+            Amount256::ZERO,
+            Rounding::HalfUp,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide with overflow")]
+    fn test_mul_div_rounded_overflow() {
+        let _ = Amount256::MAX.mul_div_rounded(
+            Amount256::from(2),
+            Amount256::from(1),
+            Rounding::HalfUp,
+        );
+    }
+
+    #[test]
     fn test_misc_branches() {
         // abs of a non-negative value returns self.
         assert_eq!(Amount256::from(3).abs(), Amount256::from(3));
@@ -1320,11 +1558,10 @@ mod tests {
         let v = Amount256::from(-42);
         assert_eq!(Amount256::from_bits(v.to_bits()), v);
         assert_eq!(Amount256::ONE.to_bits(), I256::from_i128(10000));
-        // clamp: below, inside, above.
+        // clamp: below and inside (the above case lives in test_misc).
         let (lo, hi) = (Amount256::ZERO, Amount256::ONE);
         assert_eq!(Amount256::from(-5).clamp(lo, hi), lo);
         assert_eq!(raw(5000).clamp(lo, hi), raw(5000));
-        assert_eq!(Amount256::from(5).clamp(lo, hi), hi);
         // min / max, both orders.
         let a = Amount256::from(1);
         let b = Amount256::from(2);
@@ -1509,8 +1746,8 @@ mod tests {
             assert_eq!(format!("{da}"), format!("{wa}"));
             assert_eq!(format!("{da:.2}"), format!("{wa:.2}"));
 
-            // The hand-rolled integer-rounding helpers (unlike round_to,
-            // these have per-backing implementations).
+            // The integer-rounding helpers: ceil/floor/round delegate to
+            // round_to per backing; trunc/fract stay hand-rolled.
             assert_eq!(da.ceil().0, to128(wa.ceil()), "ceil {a}");
             assert_eq!(da.floor().0, to128(wa.floor()), "floor {a}");
             assert_eq!(da.round().0, to128(wa.round()), "round {a}");
@@ -1554,6 +1791,11 @@ mod tests {
                             "div_int_rounded {a} / {n}"
                         );
                     }
+                    assert_eq!(
+                        da.checked_mul_div_rounded(da, db, mode).map(|v| v.0),
+                        wa.checked_mul_div_rounded(wa, wb, mode).map(to128),
+                        "mul_div ({a} * {a}) / {b}"
+                    );
                 }
             }
             if b != 0 {

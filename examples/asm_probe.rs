@@ -74,6 +74,14 @@ pub fn probe_amount256_sqrt(a: Amount256) -> Amount256 {
 
 #[unsafe(no_mangle)]
 #[inline(never)]
+pub fn probe_amount64_round100(a: Amount64) -> Amount64 {
+    // round_dp(2, ..) with a constant dp: the 10^(DIGITS-2) step must
+    // const-fold and strength-reduce like every constant re-scale.
+    a.round100()
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
 pub fn probe_amount128_round(a: Amount128) -> Amount128 {
     a.round_to(Rounding::HalfEven)
 }
@@ -143,6 +151,36 @@ pub fn probe_amount128_div_int(a: Amount128, n: i64) -> Amount128 {
 
 #[unsafe(no_mangle)]
 #[inline(never)]
+pub fn probe_amount64_round_dp(a: Amount64, dp: u8) -> Amount64 {
+    a.round_dp(dp, Rounding::HalfEven)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount128_round_dp(a: Amount128, dp: u8) -> Amount128 {
+    a.round_dp(dp, Rounding::HalfEven)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount256_round_dp(a: Amount256, dp: u8) -> Amount256 {
+    a.round_dp(dp, Rounding::HalfEven)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount128_split(a: Amount128, n: u32) -> Amount128 {
+    a.split_evenly(n).low
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub fn probe_amount256_split(a: Amount256, n: u32) -> Amount256 {
+    a.split_evenly(n).low
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
 pub fn probe_amount64_mul_div(a: Amount64, b: Amount64, c: Amount64) -> Amount64 {
     a.mul_div_rounded(b, c, Rounding::HalfUp)
 }
@@ -190,6 +228,18 @@ fn main() {
         "{}",
         black_box(probe_amount128_div_int(a128, black_box(10007)))
     );
+    println!("{}", black_box(probe_amount64_round100(a64)));
+    println!("{}", black_box(probe_amount64_round_dp(a64, black_box(2))));
+    println!(
+        "{}",
+        black_box(probe_amount128_round_dp(a128, black_box(2)))
+    );
+    println!(
+        "{}",
+        black_box(probe_amount256_round_dp(a256, black_box(2)))
+    );
+    println!("{}", black_box(probe_amount128_split(a128, black_box(3))));
+    println!("{}", black_box(probe_amount256_split(a256, black_box(3))));
     println!("{}", black_box(probe_amount64_sqrt(a64)));
     println!("{}", black_box(probe_amount128_sqrt(a128)));
     println!("{}", black_box(probe_amount256_sqrt(a256)));

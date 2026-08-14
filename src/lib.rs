@@ -519,8 +519,17 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     pub const SCALE_F64: f64 = Self::SCALE_INT as f64;
 
     /// Scale factor for 1/100 of unit.
+    #[deprecated(
+        since = "0.3.3",
+        note = "only served the old round100 implementation (and is 0 for DIGITS < 2); use round_dp"
+    )]
     pub const SCALE_INT_100: i64 = Self::SCALE_INT / 100;
     /// Half of scale factor for 1/100 of unit.
+    #[deprecated(
+        since = "0.3.3",
+        note = "only served the old round100 implementation (and is 0 for DIGITS < 3); use round_dp"
+    )]
+    #[allow(deprecated)]
     pub const SCALE_INT_HALF_100: i64 = Self::SCALE_INT_100 / 2;
 
     /// Constructs a new decimal integer with value 0.
@@ -996,7 +1005,14 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         self.round_to(Rounding::HalfUp)
     }
 
-    /// Rounding to 1/100th (0.01) half-way cases away from `0.0`.
+    /// Rounding to 1/100th (0.01) half-way cases away from `0.0`:
+    /// equivalent to [`round_dp`](Self::round_dp)`(2, Rounding::HalfUp)`.
+    ///
+    /// For `DIGITS <= 2` this is the identity (there is nothing beyond two
+    /// fractional digits to round). Note this is a behavior change in
+    /// 0.3.3: earlier versions incorrectly bumped every `Decimal<2>` value
+    /// by one ulp and panicked with a division by zero on `Decimal<0>` and
+    /// `Decimal<1>`.
     ///
     /// # Examples
     ///
@@ -1053,8 +1069,11 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
             neg,
             mode,
         );
-        // (q + up) * step <= mag - r + step: cannot wrap u64 (step <= 10^18
-        // since DIGITS < 19 on this backing), but may exceed the range.
+        // (q + up) * step cannot wrap u64: for DIGITS <= 18 it is at most
+        // mag - r + step < 2^63 + 10^18; at DIGITS = 19 (supported here,
+        // step = 10^19 > mag) the division gives q = 0 and the product is
+        // at most step itself. Either way it may still exceed the i64
+        // range, which the check below catches.
         let scaled = (q + up as u64) * step;
         if scaled > i64::MAX as u64 {
             return None;
@@ -1390,9 +1409,8 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
         // for wider ones. (`u128::isqrt` benches fastest on x86 but its
         // codegen contains a `__udivti3` libcall, which the crate bans; the
         // asm probes hold this path to no-128-bit-builtins.)
-        let s = limbs::isqrt_u128_any(n);
-        let rem = n - s as u128 * s as u128;
-        let up = limbs::sqrt_round_up(mode, rem == 0, rem > s as u128);
+        let (s, rem_zero, rem_gt_root) = limbs::isqrt_u128_with_rem(n);
+        let up = limbs::sqrt_round_up(mode, rem_zero, rem_gt_root);
         let mag = s + up as u64;
         if mag >> 63 != 0 {
             return None;
@@ -2364,8 +2382,6 @@ mod tests {
 
     #[test]
     fn test_round100() {
-        assert_eq!(Decimal::<4>::SCALE_INT_HALF_100, 50);
-
         assert_eq!(Decimal::<4>(10000).round100(), Decimal::<4>(10000));
         assert_eq!(Decimal::<4>(10001).round100(), Decimal::<4>(10000));
         assert_eq!(Decimal::<4>(19999).round100(), Decimal::<4>(20000));

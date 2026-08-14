@@ -14,8 +14,8 @@ use crate::Rounding;
 use crate::ipow10_i128;
 use crate::limbs::{
     cmp_twice_rem_u64, dec_div, dec_mul, dec_mul_div, div_mag_by_word, div_rem_u128_pow10,
-    isqrt_words, mul_add_word, mul_words, parse_decimal_mag_rounded, rem_mag, round_mag_to_step,
-    round_up_by_cmp, split_mag, sqrt_round_up, upow10,
+    isqrt_u128_with_rem, isqrt_words, mul_words, parse_decimal_mag_rounded, rem_mag,
+    round_mag_to_step, round_up_by_cmp, split_mag_even, sqrt_round_up, upow10,
 };
 use core::cmp::Ordering;
 use core::ops::*;
@@ -682,21 +682,6 @@ impl<const DIGITS: u8> Decimal128<DIGITS> {
         Some(Decimal128::<DIGITS>(i128_from_sign_mag(neg, q)))
     }
 
-    /// Rounds to `dp` fractional digits with the given mode, keeping the
-    /// type and scale: digits beyond `dp` become zero. `dp >= DIGITS` is
-    /// the identity; `dp == 0` matches [`round_to`](Self::round_to).
-    ///
-    /// # Panics
-    /// Panics if rounding away from zero at the very edge of the range
-    /// overflows; [`checked_round_dp`](Self::checked_round_dp) is the
-    /// non-panicking form.
-    pub fn round_dp(self, dp: u8, mode: Rounding) -> Self {
-        match self.checked_round_dp(dp, mode) {
-            Some(v) => v,
-            None => panic!("attempt to round with overflow"),
-        }
-    }
-
     /// Checked form of [`round_dp`](Self::round_dp): `None` if rounding
     /// away from zero at the very edge of the range overflows.
     pub fn checked_round_dp(self, dp: u8, mode: Rounding) -> Option<Self> {
@@ -732,33 +717,19 @@ impl<const DIGITS: u8> Decimal128<DIGITS> {
             return None;
         }
         let (neg, full) = i128_sign_mag(self.0);
-        let (mut mag, r) = split_mag(&full, n);
-        let low = Decimal128::<DIGITS>(i128_from_sign_mag(neg, mag));
-        // An inexact split implies n >= 2, hence q <= MAX / 2: no overflow.
-        let (high, high_count) = if r == 0 {
-            (low, 0)
+        let (lo, hi, r) = split_mag_even(&full, n);
+        let low = Decimal128::<DIGITS>(i128_from_sign_mag(neg, lo));
+        let high = if r == 0 {
+            low
         } else {
-            mul_add_word(&mut mag, 1, 1);
-            (Decimal128::<DIGITS>(i128_from_sign_mag(neg, mag)), r)
+            Decimal128::<DIGITS>(i128_from_sign_mag(neg, hi))
         };
         Some(EvenSplit {
             high,
-            high_count,
+            high_count: r,
             low,
-            low_count: n - high_count,
+            low_count: n - r,
         })
-    }
-
-    /// Panicking form of
-    /// [`checked_split_evenly`](Self::checked_split_evenly).
-    ///
-    /// # Panics
-    /// Panics if `n` is zero (like core's `/`).
-    pub fn split_evenly(self, n: u32) -> EvenSplit<Self> {
-        match self.checked_split_evenly(n) {
-            Some(v) => v,
-            None => panic!("attempt to divide by zero"),
-        }
     }
 
     /// Square root with the given rounding mode: `None` for a negative
@@ -779,6 +750,14 @@ impl<const DIGITS: u8> Decimal128<DIGITS> {
             return None;
         }
         let mag = self.0.unsigned_abs();
+        // Single-limb fast tier for typical money magnitudes: the scaled
+        // radicand fits u128, so the shared u128 core applies directly.
+        if mag >> 64 == 0 {
+            let n = mag * const { upow10(DIGITS as u32) } as u128;
+            let (s, rem_zero, rem_gt_root) = isqrt_u128_with_rem(n);
+            let up = sqrt_round_up(mode, rem_zero, rem_gt_root);
+            return Some(Decimal128::<DIGITS>((s as u128 + up as u128) as i128));
+        }
         let mut n = [0u64; 4];
         mul_words(
             &mut n[..3],
@@ -789,55 +768,6 @@ impl<const DIGITS: u8> Decimal128<DIGITS> {
         let up = sqrt_round_up(mode, rem_zero, rem_gt_root);
         let s = ((root[0] as u128) | ((root[1] as u128) << 64)) + up as u128;
         Some(Decimal128::<DIGITS>(s as i128))
-    }
-
-    /// Square root, explicitly applying the given rounding mode. See
-    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded).
-    ///
-    /// # Examples
-    /// ```
-    /// use fin_decimal::{Amount128, Rounding};
-    /// let two = Amount128::from(2);
-    /// assert_eq!(two.sqrt_rounded(Rounding::HalfUp), Amount128::from_str_const("1.4142"));
-    /// assert_eq!(two.sqrt_rounded(Rounding::Up), Amount128::from_str_const("1.4143"));
-    /// ```
-    ///
-    /// # Panics
-    /// Panics if `self` is negative;
-    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded) is the
-    /// non-panicking form.
-    pub fn sqrt_rounded(self, mode: Rounding) -> Self {
-        match self.checked_sqrt_rounded(mode) {
-            Some(v) => v,
-            // None only for a negative input: the root cannot overflow.
-            None => panic!("argument of integer square root cannot be negative"),
-        }
-    }
-
-    /// Square root, rounded half-up at the type's own scale (the operators'
-    /// default rounding). See
-    /// [`checked_sqrt_rounded`](Self::checked_sqrt_rounded).
-    ///
-    /// # Examples
-    /// ```
-    /// use fin_decimal::Amount128;
-    /// assert_eq!(Amount128::from_str_const("2.25").sqrt(), Amount128::from_str_const("1.5"));
-    /// ```
-    ///
-    /// # Panics
-    /// Panics if `self` is negative;
-    /// [`checked_sqrt`](Self::checked_sqrt) is the non-panicking form.
-    #[inline]
-    pub fn sqrt(self) -> Self {
-        self.sqrt_rounded(Rounding::HalfUp)
-    }
-
-    /// Checked form of [`sqrt`](Self::sqrt) (half-up rounding), mirroring
-    /// core's `checked_isqrt` on signed integers: `None` for a negative
-    /// value.
-    #[inline]
-    pub fn checked_sqrt(self) -> Option<Self> {
-        self.checked_sqrt_rounded(Rounding::HalfUp)
     }
 
     /// `self * b / c` on the exact 256-bit product with a single rounding at
@@ -1204,6 +1134,7 @@ impl<const DIGITS: u8> Rem for Decimal128<DIGITS> {
     }
 }
 
+crate::common::impl_decimal_wide_ops!(Decimal128, "Amount128");
 crate::common::impl_decimal_common!(Decimal128, "Decimal128");
 
 #[cfg(test)]

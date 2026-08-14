@@ -55,7 +55,7 @@ for fn in probe_amount64_mul probe_amount128_mul probe_amount256_mul \
           probe_amount64_mul_rate probe_amount128_mul_rate \
           probe_amount128_round probe_amount256_round \
           probe_amount128_trunc probe_amount256_trunc \
-          probe_amount128_fract; do
+          probe_amount128_fract probe_amount64_round100; do
     b=$(body "$fn")
     if [ -z "$b" ]; then
         report "$fn" "FAIL" "function not found in assembly"
@@ -78,7 +78,10 @@ for fn in probe_amount64_div probe_amount128_div probe_amount256_div \
           probe_amount128_rem probe_amount64_ratio probe_amount128_div_int \
           probe_amount64_mul_div probe_amount128_mul_div \
           probe_amount256_mul_div probe_amount64_sqrt \
-          probe_amount128_sqrt probe_amount256_sqrt; do
+          probe_amount128_sqrt probe_amount256_sqrt \
+          probe_amount64_round_dp probe_amount128_round_dp \
+          probe_amount256_round_dp probe_amount128_split \
+          probe_amount256_split; do
     b=$(body "$fn")
     if [ -z "$b" ]; then
         report "$fn" "FAIL" "function not found in assembly"

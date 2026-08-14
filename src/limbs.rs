@@ -782,14 +782,24 @@ pub(crate) fn round_mag_to_step<const W: usize>(
     q
 }
 
-/// Largest-remainder even split of a `W`-limb magnitude into `n > 0` parts:
-/// returns the truncated per-part quotient and how many parts receive one
-/// extra unit in the last place.
+/// Largest-remainder even split of a `W`-limb magnitude into `n > 0`
+/// parts: returns `(low, high, high_count)` where `high_count` parts of
+/// `high` plus `n - high_count` parts of `low` sum back to `mag` exactly.
+/// When the split is inexact, `high == low + 1` ulp; when exact,
+/// `high == low` and `high_count == 0`. The invariant-bearing core shared
+/// by the wide backings (the i64 backing keeps a const copy).
 #[inline]
-pub(crate) fn split_mag<const W: usize>(mag: &[u64; W], n: u32) -> ([u64; W], u32) {
-    let mut q = *mag;
-    let r = div_words_by_word(&mut q, n as u64) as u32;
-    (q, r)
+pub(crate) fn split_mag_even<const W: usize>(mag: &[u64; W], n: u32) -> ([u64; W], [u64; W], u32) {
+    let mut low = *mag;
+    let r = div_words_by_word(&mut low, n as u64) as u32;
+    let mut high = low;
+    if r != 0 {
+        // An inexact split implies n >= 2, hence low <= MAX / 2: the bump
+        // cannot carry out of W limbs.
+        let carry = mul_add_word(&mut high, 1, 1);
+        debug_assert!(!carry);
+    }
+    (low, high, r)
 }
 
 /// The square-root rounding decision shared by every backing: whether to
@@ -798,10 +808,12 @@ pub(crate) fn split_mag<const W: usize>(mag: &[u64; W], n: u32) -> ([u64; W], u3
 /// three half modes agree.
 #[inline]
 pub(crate) const fn sqrt_round_up(mode: Rounding, rem_zero: bool, rem_gt_root: bool) -> bool {
+    // Exhaustive on purpose, like round_up_by_cmp: a new Rounding variant
+    // must force a decision here, not silently become a half mode.
     match mode {
         Rounding::Down => false,
         Rounding::Up => !rem_zero,
-        _ => rem_gt_root,
+        Rounding::HalfUp | Rounding::HalfDown | Rounding::HalfEven => rem_gt_root,
     }
 }
 
@@ -930,6 +942,16 @@ pub(crate) const fn isqrt_u128_any(n: u128) -> u64 {
     s as u64
 }
 
+/// Floor square root of any `u128` plus the remainder facts the decimal
+/// rounding needs: `(root, rem_zero, rem_gt_root)` as in [`isqrt_words`].
+/// The shared single/two-limb fast tier of every backing's `sqrt`.
+#[inline]
+pub(crate) const fn isqrt_u128_with_rem(n: u128) -> (u64, bool, bool) {
+    let s = isqrt_u128_any(n);
+    let rem = n - (s as u128) * (s as u128);
+    (s, rem == 0, rem > s as u128)
+}
+
 /// Floor square root of an `N`-limb magnitude, plus the remainder facts the
 /// decimal rounding needs: returns `(root, rem_zero, rem_gt_root)` with
 /// `root^2 <= n < (root + 1)^2`, `rem = n - root^2`, and `rem_gt_root` the
@@ -945,15 +967,16 @@ pub(crate) const fn isqrt_u128_any(n: u128) -> u64 {
 pub(crate) fn isqrt_words<const N: usize, const R: usize, const R2: usize>(
     n: &[u64; N],
 ) -> ([u64; R], bool, bool) {
-    debug_assert!(R2 == 2 * R && R2 >= N && N <= KNUTH_MAX_M && N >= 3);
+    const {
+        assert!(R2 == 2 * R && R2 >= N && N <= KNUTH_MAX_M && N >= 3);
+    }
     let m = sig_limbs(n);
     let mut root = [0u64; R];
     if m <= 2 {
         let v = (n[0] as u128) | ((n[1] as u128) << 64);
-        let s = isqrt_u128_any(v);
+        let (s, rem_zero, rem_gt_root) = isqrt_u128_with_rem(v);
         root[0] = s;
-        let rem = v - (s as u128) * (s as u128);
-        return (root, rem == 0, rem > s as u128);
+        return (root, rem_zero, rem_gt_root);
     }
 
     // Seed from the top 127..=128 bits: r0 = isqrt(n >> e) << (e / 2) for an
@@ -974,13 +997,15 @@ pub(crate) fn isqrt_words<const N: usize, const R: usize, const R2: usize>(
         root[hw + 1] = s0 >> (64 - hb);
     }
 
-    // Two Newton (Heron) steps: root = (root + n / root) / 2. One step
-    // suffices for 3-limb inputs, the second pins 5-limb ones; running both
-    // unconditionally keeps the code uniform (the extra step is a no-op
-    // walk away from the fixed point). `n >= 2^128` makes `root >= 2^64`,
-    // so the divisor always has at least two significant limbs.
+    // Newton (Heron) steps: root = (root + n / root) / 2. The seed carries
+    // ~63 correct bits and each step doubles them, so one step suffices for
+    // 3-limb inputs (root < 2^96) and two pin 5-limb ones (root < 2^160) —
+    // and the second step is a whole div_knuth, so skipping it on the
+    // narrow shape matters. `n >= 2^128` makes `root >= 2^64`, so the
+    // divisor always has at least two significant limbs.
+    let steps = if m <= 3 { 1 } else { 2 };
     let mut i = 0;
-    while i < 2 {
+    while i < steps {
         // The true root is at least 2^64 (n >= 2^128 here); clamp an iterate
         // that undershot below one limb so div_knuth always sees a two-limb
         // divisor.

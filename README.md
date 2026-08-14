@@ -24,6 +24,8 @@ Pick `Amount64` for ledgers and carts, `Amount128` when aggregating very large b
 * **Const Generics (`Decimal<const DIGITS: u8>`)**: Zero-cost abstraction over multiple precision types (`DIGITS ≤ 19` for the wide types).
 * **Strict Rounding Modes**: Explicit `.round_to(mode)`, `.mul_rounded()`, and `.div_rounded()` methods to ensure compliance with arbitrary tax codes (`HalfUp`, `HalfEven` Banker's Rounding, `HalfDown`, `Down`, `Up`).
 * **Fused Multiply-Divide**: `.mul_div_rounded(b, c, mode)` computes `a * b / c` on the exact double-width product with a single rounding at the end — the pro-rata allocation primitive that avoids the double rounding of taking a ratio first and multiplying by it. Available on all three backings.
+* **Regulated-Boundary Rounding**: `.round_dp(dp, mode)` rounds to `dp` fractional digits while keeping the type's scale — carry 4-8 digits internally, round at the 2-digit invoice/tax boundary where the regulation says so.
+* **Penny-Conserving Splits**: `.split_evenly(n)` divides an amount into `n` parts that sum back **exactly** (largest-remainder allocation): `high_count` parts one ulp above the remaining `low_count` parts. No value is ever created or lost by splitting.
 * **Checked Math**: `.checked_add/sub/mul/div()` returning `Option` for mission-critical code paths; symmetric range (`MIN == -MAX`).
 * **Compile-Time Evaluation**: parsing, multiplication, rounding, and `powi` are `const fn`, so whole derived constants are computed by the compiler (see below).
 * **Zero Heap Allocations**: `no_std` without `alloc`; every buffer is a fixed-size stack array, including string formatting and parsing.

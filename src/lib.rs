@@ -438,6 +438,31 @@ pub enum Rounding {
     Up,
 }
 
+/// An exact even split of an amount into `n` parts, as produced by
+/// `split_evenly` on each decimal type: `high_count` parts of `high` plus
+/// `low_count` parts of `low`.
+///
+/// Invariants: `high_count + low_count == n`,
+/// `high * high_count + low * low_count == total` **exactly** (no value is
+/// ever created or lost — the penny-conservation property), and when the
+/// split is inexact `high` exceeds `low` by exactly one unit in the last
+/// place, away from zero. When the split is exact, `high == low` and
+/// `high_count == 0`.
+///
+/// For a negative total the parts are negative and `high` is the part with
+/// the larger magnitude (the more negative one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvenSplit<T> {
+    /// The larger-magnitude part (one ulp beyond `low`, away from zero).
+    pub high: T,
+    /// How many of the `n` parts are `high`.
+    pub high_count: u32,
+    /// The smaller-magnitude part (the total over `n`, toward zero).
+    pub low: T,
+    /// How many of the `n` parts are `low`.
+    pub low_count: u32,
+}
+
 /// Amount64 type implements decimal fixed-point arithmetic for financial computations.
 /// It is implemented to be as efficient as possible with most common add/sub operations
 /// to be native binary add/sub.
@@ -984,20 +1009,107 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
     /// # Panics
     /// Panics if rounding away from zero at the very edge of the range
     /// overflows.
+    #[inline]
     pub const fn round100(self) -> Self {
-        let mut frac = self.0 % Self::SCALE_INT_100;
+        self.round_dp(2, Rounding::HalfUp)
+    }
 
-        // check if rounding is needed
-        if frac >= Self::SCALE_INT_HALF_100 {
-            frac -= Self::SCALE_INT_100
-        } else if frac <= -Self::SCALE_INT_HALF_100 {
-            frac += Self::SCALE_INT_100
-        }
-        // Checked: must panic, not wrap, under the consumer's release
-        // profile (see round_to).
-        match self.0.checked_sub(frac) {
-            Some(v) => Decimal::<DIGITS>(v),
+    /// Rounds to `dp` fractional digits with the given mode, keeping the
+    /// type and scale: digits beyond `dp` become zero. `dp >= DIGITS` is
+    /// the identity; `dp == 0` matches [`round_to`](Self::round_to).
+    ///
+    /// The typical use is carrying full precision internally while rounding
+    /// at a regulated boundary (e.g. tax at 2 decimal places on an
+    /// 8-digit-rate computation). Usable in const contexts.
+    ///
+    /// # Panics
+    /// Panics if rounding away from zero at the very edge of the range
+    /// overflows; [`checked_round_dp`](Self::checked_round_dp) is the
+    /// non-panicking form.
+    pub const fn round_dp(self, dp: u8, mode: Rounding) -> Self {
+        match self.checked_round_dp(dp, mode) {
+            Some(v) => v,
             None => panic!("attempt to round with overflow"),
+        }
+    }
+
+    /// Checked form of [`round_dp`](Self::round_dp): `None` if rounding
+    /// away from zero at the very edge of the range overflows.
+    pub const fn checked_round_dp(self, dp: u8, mode: Rounding) -> Option<Self> {
+        if dp >= DIGITS {
+            return Some(self);
+        }
+        // `step` is a runtime divisor here (dp is a runtime parameter), so
+        // native word division is the right tool.
+        let step = limbs::upow10((DIGITS - dp) as u32);
+        let neg = self.0 < 0;
+        let mag = self.0.unsigned_abs();
+        let q = mag / step;
+        let r = mag % step;
+        let up = limbs::round_up_by_cmp(
+            limbs::cmp_twice_rem_u64(r, step),
+            r == 0,
+            q & 1 != 0,
+            neg,
+            mode,
+        );
+        // (q + up) * step <= mag - r + step: cannot wrap u64 (step <= 10^18
+        // since DIGITS < 19 on this backing), but may exceed the range.
+        let scaled = (q + up as u64) * step;
+        if scaled > i64::MAX as u64 {
+            return None;
+        }
+        Some(Decimal::<DIGITS>(i64_from_sign_mag(neg, [scaled])))
+    }
+
+    /// Splits `self` into `n` parts that sum back to `self` **exactly**:
+    /// `high_count` parts one unit in the last place larger than the
+    /// remaining `low_count` parts (largest-remainder allocation). `None`
+    /// if `n` is zero. Usable in const contexts.
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::Amount64;
+    /// let split = Amount64::from_str_const("100.00").checked_split_evenly(3).unwrap();
+    /// // 1 part of 33.3334 + 2 parts of 33.3333 == 100.0000 exactly.
+    /// assert_eq!(split.high, Amount64::from_str_const("33.3334"));
+    /// assert_eq!(split.high_count, 1);
+    /// assert_eq!(split.low, Amount64::from_str_const("33.3333"));
+    /// assert_eq!(split.low_count, 2);
+    /// ```
+    pub const fn checked_split_evenly(self, n: u32) -> Option<EvenSplit<Self>> {
+        if n == 0 {
+            return None;
+        }
+        let neg = self.0 < 0;
+        let mag = self.0.unsigned_abs();
+        let q = mag / n as u64;
+        let r = (mag % n as u64) as u32;
+        let low = Decimal::<DIGITS>(i64_from_sign_mag(neg, [q]));
+        // For n == 1 the split is exact (r == 0), so q + 1 below never
+        // overflows: an inexact split implies n >= 2, hence q <= MAX / 2.
+        let (high, high_count) = if r == 0 {
+            (low, 0)
+        } else {
+            (Decimal::<DIGITS>(i64_from_sign_mag(neg, [q + 1])), r)
+        };
+        Some(EvenSplit {
+            high,
+            high_count,
+            low,
+            low_count: n - high_count,
+        })
+    }
+
+    /// Panicking form of
+    /// [`checked_split_evenly`](Self::checked_split_evenly).
+    ///
+    /// # Panics
+    /// Panics if `n` is zero (like core's `/`).
+    pub const fn split_evenly(self, n: u32) -> EvenSplit<Self> {
+        match self.checked_split_evenly(n) {
+            Some(v) => v,
+            None => panic!("attempt to divide by zero"),
         }
     }
 
@@ -1273,26 +1385,14 @@ impl<const DIGITS: u8> Decimal<DIGITS> {
             return None;
         }
         let n = self.0 as u128 * const { limbs::upow10(DIGITS as u32) } as u128;
-        // Single-limb inputs (typical money magnitudes) take core's
-        // `u64::isqrt` (native word divisions only); wider ones take the
-        // crate's division-free f64-seeded Newton core. `u128::isqrt` would
-        // be the obvious choice — and benches fastest on x86 — but its
-        // codegen contains a `__udivti3` libcall, which the crate bans
-        // (software division on most non-x86 targets); the asm probes hold
-        // this path to no-128-bit-builtins.
-        let s = if n >> 64 == 0 {
-            (n as u64).isqrt()
-        } else {
-            limbs::isqrt_f64(n)
-        };
+        // The shared u128 core: core's `u64::isqrt` for single-limb inputs
+        // (native word divisions only), the division-free f64-seeded Newton
+        // for wider ones. (`u128::isqrt` benches fastest on x86 but its
+        // codegen contains a `__udivti3` libcall, which the crate bans; the
+        // asm probes hold this path to no-128-bit-builtins.)
+        let s = limbs::isqrt_u128_any(n);
         let rem = n - s as u128 * s as u128;
-        let up = match mode {
-            Rounding::Down => false,
-            Rounding::Up => rem != 0,
-            // Half modes, tie-free: round up iff n > s^2 + s, i.e. n is
-            // past (s + 1/2)^2.
-            _ => rem > s as u128,
-        };
+        let up = limbs::sqrt_round_up(mode, rem == 0, rem > s as u128);
         let mag = s + up as u64;
         if mag >> 63 != 0 {
             return None;
@@ -2580,6 +2680,9 @@ mod tests {
         const REM: Option<Amount64> = PRICE.checked_rem(Amount64::from_str_const("3"));
         const POW_OVER: Option<Amount64> = Amount64::MAX.checked_powi(2);
         const RND_OVER: Option<Amount64> = Amount64::MAX.checked_round_to(Rounding::Up);
+        const RDP: Amount64 = Amount64::from_str_const("12.3456").round_dp(2, Rounding::HalfUp);
+        const EVEN: Option<crate::EvenSplit<Amount64>> =
+            Amount64::from_str_const("100.00").checked_split_evenly(3);
         // Cross-scale multiply (4-digit amount x 8-digit rate) and integer
         // division both evaluate at compile time.
         const FEE: Amount64 = PRICE.mul_rounded(Rate64::from_str_const("0.0725"), Rounding::HalfUp);
@@ -2601,6 +2704,8 @@ mod tests {
         assert_eq!(REM, Some(Amount64::from_str_const("1.99")));
         assert_eq!(POW_OVER, None);
         assert_eq!(RND_OVER, None);
+        assert_eq!(RDP, Amount64::from_str_const("12.35"));
+        assert_eq!(EVEN.unwrap().high, Amount64::from_str_const("33.3334"));
         assert_eq!(
             FEE,
             price.mul_rounded(Rate64::from_str("0.0725").unwrap(), Rounding::HalfUp)
@@ -3157,6 +3262,104 @@ mod tests {
         for m in [-19999i64, -10001, -9999, 0, 9999, 10001, 19999] {
             assert_eq!(Decimal::<4>(m).ceil(), -Decimal::<4>(-m).floor(), "{m}");
         }
+    }
+
+    #[test]
+    fn test_round_dp() {
+        use crate::Rounding::*;
+        let v = Amount64::from_str_const("12.3456");
+        assert_eq!(v.round_dp(2, HalfUp), Amount64::from_str_const("12.35"));
+        assert_eq!(v.round_dp(2, Down), Amount64::from_str_const("12.34"));
+        assert_eq!(v.round_dp(3, HalfUp), Amount64::from_str_const("12.346"));
+        // dp >= DIGITS is the identity.
+        assert_eq!(v.round_dp(4, HalfUp), v);
+        assert_eq!(v.round_dp(200, HalfUp), v);
+        // dp == 0 matches round_to, every mode.
+        let w = Amount64::from_str_const("-7.5000");
+        for mode in [HalfUp, HalfDown, HalfEven, Down, Up] {
+            assert_eq!(v.round_dp(0, mode), v.round_to(mode), "{mode:?}");
+            assert_eq!(w.round_dp(0, mode), w.round_to(mode), "{mode:?}");
+        }
+        // HalfEven ties look at the parity of the kept digit.
+        assert_eq!(
+            Amount64::from_str_const("0.0250").round_dp(2, HalfEven),
+            Amount64::from_str_const("0.02")
+        );
+        assert_eq!(
+            Amount64::from_str_const("0.0350").round_dp(2, HalfEven),
+            Amount64::from_str_const("0.04")
+        );
+        // Negative values round on the magnitude with directional modes.
+        let neg = Amount64::from_str_const("-12.3456");
+        assert_eq!(neg.round_dp(2, Down), Amount64::from_str_const("-12.35"));
+        assert_eq!(neg.round_dp(2, Up), Amount64::from_str_const("-12.34"));
+        // The very edge of the range overflows.
+        assert_eq!(Amount64::MAX.checked_round_dp(2, Up), None);
+        assert_eq!(Amount64::MIN.checked_round_dp(2, Down), None);
+        // round100 delegates to round_dp(2, HalfUp).
+        assert_eq!(v.round100(), v.round_dp(2, HalfUp));
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to round with overflow")]
+    fn test_round_dp_edge_overflow_panics() {
+        let _ = Amount64::MAX.round_dp(2, Rounding::Up);
+    }
+
+    #[test]
+    fn test_split_evenly() {
+        // Doc case plus invariants over random totals and part counts.
+        let s = Amount64::from_str_const("100.00").split_evenly(3);
+        assert_eq!(s.high.0, 333_334);
+        assert_eq!(s.high_count, 1);
+        assert_eq!(s.low.0, 333_333);
+        assert_eq!(s.low_count, 2);
+
+        // Exact split: high == low, high_count == 0.
+        let s = Amount64::from_str_const("100.00").split_evenly(4);
+        assert_eq!((s.high, s.high_count), (s.low, 0));
+        assert_eq!((s.low.0, s.low_count), (250_000, 4));
+
+        // n == 1 and zero totals.
+        let v = Amount64::from_str_const("-3.1415");
+        let s = v.split_evenly(1);
+        assert_eq!((s.low, s.low_count, s.high_count), (v, 1, 0));
+        let s = Amount64::ZERO.split_evenly(7);
+        assert_eq!((s.low, s.low_count, s.high_count), (Amount64::ZERO, 7, 0));
+
+        assert_eq!(v.checked_split_evenly(0), None);
+
+        // Conservation and shape over random inputs, both signs.
+        let mut state = 0x5EED5EED5EEDu64;
+        let mut rng = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        for _ in 0..20000 {
+            let m = (rng() as i64) >> (rng() % 40);
+            let n = 1 + (rng() % 999) as u32;
+            let v = Decimal::<4>(m);
+            let s = v.split_evenly(n);
+            assert_eq!(s.high_count + s.low_count, n);
+            assert_eq!(
+                s.high.0 as i128 * s.high_count as i128 + s.low.0 as i128 * s.low_count as i128,
+                m as i128,
+                "conservation {m} / {n}"
+            );
+            if s.high_count > 0 {
+                assert_eq!(s.high.0 - s.low.0, if m < 0 { -1 } else { 1 }, "{m} {n}");
+            } else {
+                assert_eq!(s.high, s.low);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_split_evenly_zero_panics() {
+        let _ = Amount64::from(1).split_evenly(0);
     }
 
     #[test]

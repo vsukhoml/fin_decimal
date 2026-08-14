@@ -9,12 +9,13 @@
 //! `asm` feature, or a fast portable long division otherwise.
 
 use crate::AmountErrorKind;
+use crate::EvenSplit;
 use crate::Rounding;
 use crate::ipow10_i128;
 use crate::limbs::{
-    cmp_twice_rem_u64, dec_div, dec_mul, dec_mul_div, div_knuth, div_rem_u128_pow10,
-    div_words_by_word, isqrt_words, mul_add_word, mul_words, parse_decimal_mag_rounded,
-    round_up_by_cmp, upow10,
+    cmp_twice_rem_u64, dec_div, dec_mul, dec_mul_div, div_mag_by_word, div_rem_u128_pow10,
+    isqrt_words, mul_add_word, mul_words, parse_decimal_mag_rounded, rem_mag, round_mag_to_step,
+    round_up_by_cmp, split_mag, sqrt_round_up, upow10,
 };
 use core::cmp::Ordering;
 use core::ops::*;
@@ -56,24 +57,12 @@ fn i128_rem(a: i128, b: i128) -> i128 {
     let neg = a < 0;
     let am = a.unsigned_abs();
     let bm = b.unsigned_abs();
-    let r = if bm >> 64 == 0 {
-        let mut q = [am as u64, (am >> 64) as u64];
-        div_words_by_word(&mut q, bm as u64) as u128
-    } else if am < bm {
-        am // the divisor is larger, so the dividend is the remainder
-    } else {
-        let mut q = [0u64];
-        let mut r = [0u64; 2];
-        div_knuth(
-            &mut q,
-            &mut r,
-            &[am as u64, (am >> 64) as u64],
-            &[bm as u64, (bm >> 64) as u64],
-        );
-        ((r[1] as u128) << 64) | r[0] as u128
-    };
-    // r < |b| <= 2^127 (and in the pass-through branch |a| < |b|), so the
-    // remainder always fits an i128 with either sign.
+    let r = rem_mag(
+        &[am as u64, (am >> 64) as u64],
+        &[bm as u64, (bm >> 64) as u64],
+    );
+    let r = ((r[1] as u128) << 64) | r[0] as u128;
+    // r < |b| <= 2^127, so the remainder always fits an i128 either sign.
     if neg { -(r as i128) } else { r as i128 }
 }
 
@@ -687,14 +676,89 @@ impl<const DIGITS: u8> Decimal128<DIGITS> {
         if n == 0 {
             return None;
         }
-        let (an, mut mag) = i128_sign_mag(self.0);
+        let (an, mag) = i128_sign_mag(self.0);
         let neg = an != (n < 0);
-        let d = n.unsigned_abs();
-        let r = div_words_by_word(&mut mag, d);
-        if round_up_by_cmp(cmp_twice_rem_u64(r, d), r == 0, mag[0] & 1 != 0, neg, mode) {
-            mul_add_word(&mut mag, 1, 1);
+        let q = div_mag_by_word(neg, &mag, n.unsigned_abs(), mode);
+        Some(Decimal128::<DIGITS>(i128_from_sign_mag(neg, q)))
+    }
+
+    /// Rounds to `dp` fractional digits with the given mode, keeping the
+    /// type and scale: digits beyond `dp` become zero. `dp >= DIGITS` is
+    /// the identity; `dp == 0` matches [`round_to`](Self::round_to).
+    ///
+    /// # Panics
+    /// Panics if rounding away from zero at the very edge of the range
+    /// overflows; [`checked_round_dp`](Self::checked_round_dp) is the
+    /// non-panicking form.
+    pub fn round_dp(self, dp: u8, mode: Rounding) -> Self {
+        match self.checked_round_dp(dp, mode) {
+            Some(v) => v,
+            None => panic!("attempt to round with overflow"),
         }
-        Some(Decimal128::<DIGITS>(i128_from_sign_mag(neg, mag)))
+    }
+
+    /// Checked form of [`round_dp`](Self::round_dp): `None` if rounding
+    /// away from zero at the very edge of the range overflows.
+    pub fn checked_round_dp(self, dp: u8, mode: Rounding) -> Option<Self> {
+        if dp >= DIGITS {
+            return Some(self);
+        }
+        let step = upow10((DIGITS - dp) as u32);
+        let (neg, mag) = i128_sign_mag(self.0);
+        let q = round_mag_to_step(neg, &mag, step, mode);
+        if q[1] >> 63 != 0 {
+            return None;
+        }
+        Some(Decimal128::<DIGITS>(i128_from_sign_mag(neg, q)))
+    }
+
+    /// Splits `self` into `n` parts that sum back to `self` **exactly**:
+    /// `high_count` parts one unit in the last place larger than the
+    /// remaining `low_count` parts (largest-remainder allocation). `None`
+    /// if `n` is zero.
+    ///
+    /// # Examples
+    /// ```
+    /// use fin_decimal::Amount128;
+    /// let split = Amount128::from_str_const("100.00").checked_split_evenly(3).unwrap();
+    /// // 1 part of 33.3334 + 2 parts of 33.3333 == 100.0000 exactly.
+    /// assert_eq!(split.high, Amount128::from_str_const("33.3334"));
+    /// assert_eq!(split.high_count, 1);
+    /// assert_eq!(split.low, Amount128::from_str_const("33.3333"));
+    /// assert_eq!(split.low_count, 2);
+    /// ```
+    pub fn checked_split_evenly(self, n: u32) -> Option<EvenSplit<Self>> {
+        if n == 0 {
+            return None;
+        }
+        let (neg, full) = i128_sign_mag(self.0);
+        let (mut mag, r) = split_mag(&full, n);
+        let low = Decimal128::<DIGITS>(i128_from_sign_mag(neg, mag));
+        // An inexact split implies n >= 2, hence q <= MAX / 2: no overflow.
+        let (high, high_count) = if r == 0 {
+            (low, 0)
+        } else {
+            mul_add_word(&mut mag, 1, 1);
+            (Decimal128::<DIGITS>(i128_from_sign_mag(neg, mag)), r)
+        };
+        Some(EvenSplit {
+            high,
+            high_count,
+            low,
+            low_count: n - high_count,
+        })
+    }
+
+    /// Panicking form of
+    /// [`checked_split_evenly`](Self::checked_split_evenly).
+    ///
+    /// # Panics
+    /// Panics if `n` is zero (like core's `/`).
+    pub fn split_evenly(self, n: u32) -> EvenSplit<Self> {
+        match self.checked_split_evenly(n) {
+            Some(v) => v,
+            None => panic!("attempt to divide by zero"),
+        }
     }
 
     /// Square root with the given rounding mode: `None` for a negative
@@ -722,12 +786,7 @@ impl<const DIGITS: u8> Decimal128<DIGITS> {
             &[const { upow10(DIGITS as u32) }],
         );
         let (root, rem_zero, rem_gt_root) = isqrt_words::<4, 2, 4>(&n);
-        let up = match mode {
-            Rounding::Down => false,
-            Rounding::Up => !rem_zero,
-            // Half modes, tie-free: round up iff n is past (s + 1/2)^2.
-            _ => rem_gt_root,
-        };
+        let up = sqrt_round_up(mode, rem_zero, rem_gt_root);
         let s = ((root[0] as u128) | ((root[1] as u128) << 64)) + up as u128;
         Some(Decimal128::<DIGITS>(s as i128))
     }
@@ -1761,6 +1820,74 @@ mod tests {
     }
 
     #[test]
+    fn test_round_dp() {
+        use crate::Rounding::*;
+        let v = Amount128::from_str_const("12.3456");
+        assert_eq!(v.round_dp(2, HalfUp), Amount128::from_str_const("12.35"));
+        assert_eq!(v.round_dp(2, Down), Amount128::from_str_const("12.34"));
+        assert_eq!(v.round_dp(3, HalfUp), Amount128::from_str_const("12.346"));
+        assert_eq!(v.round_dp(4, HalfUp), v);
+        assert_eq!(v.round_dp(200, HalfUp), v);
+        let w = Amount128::from_str_const("-7.5000");
+        for mode in [HalfUp, HalfDown, HalfEven, Down, Up] {
+            assert_eq!(v.round_dp(0, mode), v.round_to(mode), "{mode:?}");
+            assert_eq!(w.round_dp(0, mode), w.round_to(mode), "{mode:?}");
+        }
+        assert_eq!(
+            Amount128::from_str_const("0.0250").round_dp(2, HalfEven),
+            Amount128::from_str_const("0.02")
+        );
+        assert_eq!(
+            Amount128::from_str_const("0.0350").round_dp(2, HalfEven),
+            Amount128::from_str_const("0.04")
+        );
+        let neg = Amount128::from_str_const("-12.3456");
+        assert_eq!(neg.round_dp(2, Down), Amount128::from_str_const("-12.35"));
+        assert_eq!(neg.round_dp(2, Up), Amount128::from_str_const("-12.34"));
+        assert_eq!(Amount128::MAX.checked_round_dp(2, Up), None);
+        assert_eq!(Amount128::MIN.checked_round_dp(2, Down), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to round with overflow")]
+    fn test_round_dp_edge_overflow_panics() {
+        let _ = Amount128::MAX.round_dp(2, Rounding::Up);
+    }
+
+    #[test]
+    fn test_split_evenly() {
+        let s = Amount128::from_str_const("100.00").split_evenly(3);
+        assert_eq!(s.high, Amount128::from_str_const("33.3334"));
+        assert_eq!(s.high_count, 1);
+        assert_eq!(s.low, Amount128::from_str_const("33.3333"));
+        assert_eq!(s.low_count, 2);
+        // Exact split: high == low, high_count == 0.
+        let s = Amount128::from_str_const("100.00").split_evenly(4);
+        assert_eq!((s.high, s.high_count), (s.low, 0));
+        assert_eq!((s.low, s.low_count), (Amount128::from_str_const("25"), 4));
+        // Conservation on a value beyond the narrower backings, checked by
+        // summing the parts back with exact type arithmetic.
+        let big = Amount128::from_str_const("100000000000000000000.07");
+        let s = big.split_evenly(9);
+        assert_eq!(s.high_count + s.low_count, 9);
+        let back = s.high * (s.high_count as i64) + s.low * (s.low_count as i64);
+        assert_eq!(back, big, "conservation");
+        assert_eq!(s.high - s.low, Amount128::from_bits(1));
+        // Negative totals: parts negative, high has the larger magnitude.
+        let s = Amount128::from_str_const("-1.0001").split_evenly(2);
+        let back = s.high * (s.high_count as i64) + s.low * (s.low_count as i64);
+        assert_eq!(back, Amount128::from_str_const("-1.0001"));
+        assert!(s.high < s.low);
+        assert_eq!(Amount128::from(1).checked_split_evenly(0), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_split_evenly_zero_panics() {
+        let _ = Amount128::from(1).split_evenly(0);
+    }
+
+    #[test]
     fn test_sqrt() {
         use crate::Rounding::*;
         // Exact squares round-trip; zero is exact.
@@ -2043,6 +2170,15 @@ mod tests {
             assert_eq!(da.round().0 as i128, wa.round().0, "round {a}");
             assert_eq!(da.trunc().0 as i128, wa.trunc().0, "trunc {a}");
             assert_eq!(da.fract().0 as i128, wa.fract().0, "fract {a}");
+            let n = 1 + ((a as u32) & 63);
+            let (sd, sw) = (da.split_evenly(n), wa.split_evenly(n));
+            assert_eq!(sd.high.0 as i128, sw.high.0, "split high {a} / {n}");
+            assert_eq!(sd.low.0 as i128, sw.low.0, "split low {a} / {n}");
+            assert_eq!(
+                (sd.high_count, sd.low_count),
+                (sw.high_count, sw.low_count),
+                "split counts {a} / {n}"
+            );
 
             // Cross-scale operands (an 8-digit rate) for mul_rounded.
             let rb = Decimal::<8>(b);
@@ -2090,6 +2226,13 @@ mod tests {
                         wa.abs().sqrt_rounded(mode).0,
                         "sqrt |{a}|"
                     );
+                    for dp in [0u8, 1, 2, 3] {
+                        assert_eq!(
+                            da.round_dp(dp, mode).0 as i128,
+                            wa.round_dp(dp, mode).0,
+                            "round_dp({dp}) {a}"
+                        );
+                    }
                 }
             }
             if b != 0 {

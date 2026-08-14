@@ -719,6 +719,92 @@ pub(crate) fn dec_mul_div<const W: usize, const W2: usize>(
     round_quotient::<W>(&prod, rem_cmp, rem_zero, neg, mode)
 }
 
+/// Remainder of `a` by non-zero `b` on `W`-limb magnitudes (`|a| mod |b|`):
+/// the shared core of the wide backings' `%` operator. Single-limb divisors
+/// take word division; a dividend narrower than the divisor passes through;
+/// wider divisors take Knuth's algorithm D over significant limbs only.
+#[inline]
+pub(crate) fn rem_mag<const W: usize>(a: &[u64; W], b: &[u64; W]) -> [u64; W] {
+    let n = sig_limbs(b);
+    let mut r = [0u64; W];
+    if n == 1 {
+        let mut q = *a;
+        r[0] = div_words_by_word(&mut q, b[0]);
+        return r;
+    }
+    // |a| < |b|: the dividend is the remainder. A value compare (not just a
+    // limb-count one) — this fast path is measurably load-bearing for
+    // remainders of same-width operands.
+    if cmp_words(a, b) == Ordering::Less {
+        return *a;
+    }
+    let m = sig_limbs(a);
+    let mut q = [0u64; W];
+    div_knuth(&mut q[..m - n + 1], &mut r[..n], &a[..m], &b[..n]);
+    r
+}
+
+/// Divides a `W`-limb magnitude by a single non-zero word, applying the
+/// shared rounding decision: the wide backings' integer-divisor core
+/// (`div_int_rounded`, and the division half of `round_dp`). The result
+/// magnitude never exceeds the input's: rounding up requires `d >= 2`.
+#[inline]
+pub(crate) fn div_mag_by_word<const W: usize>(
+    neg: bool,
+    mag: &[u64; W],
+    d: u64,
+    mode: Rounding,
+) -> [u64; W] {
+    let mut q = *mag;
+    let r = div_words_by_word(&mut q, d);
+    if round_up_by_cmp(cmp_twice_rem_u64(r, d), r == 0, q[0] & 1 != 0, neg, mode) {
+        mul_add_word(&mut q, 1, 1);
+    }
+    q
+}
+
+/// Rounds a `W`-limb magnitude to a multiple of `step` (a single-limb
+/// runtime divisor, `10^(DIGITS - dp)` at the call sites): divide with the
+/// shared rounding decision, then rebuild `(q + up) * step`. The caller
+/// applies its own top-of-range check; the multiply-back itself cannot
+/// carry out of `W` limbs (`(q + up) * step <= mag + step`, and `mag`'s top
+/// bit is clear on every backing).
+#[inline]
+pub(crate) fn round_mag_to_step<const W: usize>(
+    neg: bool,
+    mag: &[u64; W],
+    step: u64,
+    mode: Rounding,
+) -> [u64; W] {
+    let mut q = div_mag_by_word(neg, mag, step, mode);
+    let carry = mul_add_word(&mut q, step, 0);
+    debug_assert!(!carry);
+    q
+}
+
+/// Largest-remainder even split of a `W`-limb magnitude into `n > 0` parts:
+/// returns the truncated per-part quotient and how many parts receive one
+/// extra unit in the last place.
+#[inline]
+pub(crate) fn split_mag<const W: usize>(mag: &[u64; W], n: u32) -> ([u64; W], u32) {
+    let mut q = *mag;
+    let r = div_words_by_word(&mut q, n as u64) as u32;
+    (q, r)
+}
+
+/// The square-root rounding decision shared by every backing: whether to
+/// bump the floor root, given the remainder facts from the isqrt cores.
+/// Half-mode ties cannot occur (`(s + 1/2)^2` is never an integer), so the
+/// three half modes agree.
+#[inline]
+pub(crate) const fn sqrt_round_up(mode: Rounding, rem_zero: bool, rem_gt_root: bool) -> bool {
+    match mode {
+        Rounding::Down => false,
+        Rounding::Up => !rem_zero,
+        _ => rem_gt_root,
+    }
+}
+
 /// Decides whether a truncated magnitude should be rounded up (away from the
 /// integer's current value on the magnitude scale), given the ordering of
 /// `2 * remainder` against the divisor.
@@ -822,8 +908,9 @@ pub const fn isqrt_f64(n: u128) -> u64 {
 /// be set): single-limb inputs take core's `u64::isqrt` (native word
 /// divisions only), wider ones the division-free f64-seeded core, with
 /// inputs at or above `2^127` reduced by `isqrt(n) = 2 * isqrt(n / 4)`
-/// plus a one-step walk.
-fn isqrt_u128_any(n: u128) -> u64 {
+/// plus a one-step walk. Const-evaluable and division-instruction-free
+/// above one limb, like [`isqrt_f64`].
+pub(crate) const fn isqrt_u128_any(n: u128) -> u64 {
     if n >> 64 == 0 {
         return (n as u64).isqrt();
     }
@@ -924,8 +1011,15 @@ pub(crate) fn isqrt_words<const N: usize, const R: usize, const R2: usize>(
             sum[j] = lo | hi;
             j += 1;
         }
-        debug_assert!(is_zero(&sum[R..]));
-        root.copy_from_slice(&sum[..R]);
+        if !is_zero(&sum[R..]) {
+            // The iterate is at most ceil(sqrt(n)) + O(1), so exceeding R
+            // limbs only happens when the true root sits at the very top of
+            // the range (e.g. all-ones input, root 2^(64R) - 1): saturate
+            // and let the fixup walk land on the exact floor.
+            root = [u64::MAX; R];
+        } else {
+            root.copy_from_slice(&sum[..R]);
+        }
         i += 1;
     }
 
@@ -1907,6 +2001,13 @@ mod tests {
             );
         }
 
+        // Deterministic extremes: all-ones inputs give an all-ones root, so
+        // the "root + 1 does not fit R limbs" fixup break is exercised.
+        check::<4, 2, 4>(&[u64::MAX; 4]);
+        check::<6, 3, 6>(&[u64::MAX; 6]);
+        check::<4, 2, 4>(&[0, 0, 0, u64::MAX]);
+        check::<6, 3, 6>(&[0, 0, 0, 0, 0, u64::MAX]);
+
         let mut rng = Rng(0x15C4A57B00B5);
         for iter in 0..20000 {
             let mut n4 = [0u64; 4];
@@ -1921,7 +2022,7 @@ mod tests {
             for x in n6.iter_mut().take(w6) {
                 *x = rng.next();
             }
-            match iter % 4 {
+            match iter % 5 {
                 0 => {
                     n4[w4 - 1] |= 1 << 63; // saturate the top bit
                     n6[w6 - 1] |= 1 << 63;
@@ -1939,6 +2040,40 @@ mod tests {
                     if iter % 8 == 6 {
                         n4[0] = n4[0].wrapping_add(1);
                         n6[0] = n6[0].wrapping_add(1);
+                    }
+                }
+                3 => {
+                    // Wide perfect squares and their +-1 / +2s neighbors:
+                    // the exact-boundary shapes that force the post-Newton
+                    // fixup walks in both directions.
+                    let r4 = [rng.next(), rng.next() >> 33, 0, 0]; // ~95-bit root
+                    let r6 = [rng.next(), rng.next(), rng.next() >> 34, 0, 0, 0]; // ~158-bit
+                    let mut sq4 = [0u64; 4];
+                    mul_words(&mut sq4, &r4[..2], &r4[..2]);
+                    let mut sq6 = [0u64; 6];
+                    mul_words(&mut sq6, &r6[..3], &r6[..3]);
+                    n4 = sq4;
+                    n6 = sq6;
+                    match iter % 3 {
+                        0 => {
+                            // n = root^2 - 1 (previous root, maximal rem).
+                            let b4 = n4[0] == 0;
+                            n4[0] = n4[0].wrapping_sub(1);
+                            if b4 {
+                                n4[1] = n4[1].wrapping_sub(1);
+                            }
+                            let b6 = n6[0] == 0;
+                            n6[0] = n6[0].wrapping_sub(1);
+                            if b6 {
+                                n6[1] = n6[1].wrapping_sub(1);
+                            }
+                        }
+                        1 => {
+                            // n = root^2 + 1 (minimal non-zero rem).
+                            n4[0] = n4[0].wrapping_add(1);
+                            n6[0] = n6[0].wrapping_add(1);
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
